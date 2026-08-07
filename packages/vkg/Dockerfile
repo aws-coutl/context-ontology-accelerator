@@ -1,6 +1,6 @@
 # VKG Translation Service - Ontop 5.x, translation-only mode
 # Uses Amazon Corretto 17 on AL2023 (public ECR, no Docker Hub dependency, actively patched)
-FROM public.ecr.aws/amazoncorretto/amazoncorretto:17-al2023@sha256:6b86be3727b42b8e808df094532d492f070af9bbbe4427cdd83f781838827279
+FROM public.ecr.aws/amazoncorretto/amazoncorretto:17-al2023@sha256:28f8f320d2a0d8b89d781079926d451c471deb84bb223537d219a8ed74e9ff30
 
 ARG ONTOP_VERSION=5.5.0
 ARG ONTOP_SHA256=430dff312e68e8ad41d26e6113160ca2365c28c4fe911926193000a33299458f

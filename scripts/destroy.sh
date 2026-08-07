@@ -17,7 +17,16 @@
 #      created outside CFN by the reload Lambda) and wait for them to
 #      reach INACTIVE, so ECS DeleteCluster doesn't fail with
 #      ClusterContainsServicesException.
-#   4. Force-delete the DataZone domain via
+#   4. Delete the Cloud Map services registered inside the private DNS
+#      namespace. CFN owns the namespace (network-stack) but NOT the
+#      services inside it — those are created at runtime by the VKG
+#      reload Lambda (`servicediscovery:CreateService`), so CFN has no
+#      record of them. DeleteNamespace fails while any service remains,
+#      which puts the network stack in DELETE_FAILED. The application's
+#      own namespace-delete flow cleans these up
+#      (namespace-deletion-pipeline.ts), but this script never takes that
+#      path, so anything left behind has to be cleared here.
+#   5. Force-delete the DataZone domain via
 #      `delete-domain --skip-deletion-check`, which cascades to every
 #      project, asset, and asset type under it. CFN's own DeleteProject
 #      calls (which it already issues with skipDeletionCheck=true
@@ -28,7 +37,7 @@
 #      grants, etc.) are RemovalPolicy.RETAIN in namespace-stack.ts so
 #      CFN never attempts (and fails) to delete them itself; this step
 #      is what actually tears the whole tree down.
-#   5. `cdk destroy --all`, then verify no stacks remain.
+#   6. `cdk destroy --all`, then verify no stacks remain.
 #
 # Mirrors deploy.sh's context resolution so `make destroy-dev` tears
 # down exactly what `make deploy-dev` created.
@@ -37,7 +46,11 @@ set -uo pipefail
 ENV="${1:-dev}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REGION="${CDK_DEFAULT_REGION:-${AWS_DEFAULT_REGION:-${AWS_REGION:-us-east-1}}}"
-PREFIX="${SCL_PREFIX:-scl}"
+# Default MUST match the CDK app's DEFAULT_RESOURCE_PREFIX
+# (libs/ts-shared/src/constants.ts, resolved in infra/lib/context.ts).
+# A mismatch means this script resolves scl-* names / /scl SSM parameters
+# while `cdk` operates on coa-* — every lookup silently misses.
+PREFIX="${SCL_PREFIX:-coa}"
 STACK_PREFIX="${PREFIX}-${ENV}"
 SSM_PREFIX="/${PREFIX}"
 
@@ -63,6 +76,7 @@ ENI_WAIT_MAX_SECONDS="${SCL_ENI_WAIT_MAX_SECONDS:-600}"
 ENI_POLL_INTERVAL_SECONDS=15
 ECS_WAIT_MAX_SECONDS="${SCL_ECS_WAIT_MAX_SECONDS:-300}"
 DOMAIN_WAIT_MAX_SECONDS="${SCL_DOMAIN_WAIT_MAX_SECONDS:-300}"
+CLOUDMAP_WAIT_MAX_SECONDS="${SCL_CLOUDMAP_WAIT_MAX_SECONDS:-180}"
 
 info() { echo "  ->   $1"; }
 ok() { echo "  OK:  $1"; }
@@ -96,7 +110,7 @@ arn_id() { echo "$1" | awk -F/ '{print $NF}'; }
 
 # ── Step 1: Delete AgentCore Runtimes ──────────────────────────────────────
 echo ""
-echo "=== Step 1/5: Delete AgentCore Runtimes ==="
+echo "=== Step 1/6: Delete AgentCore Runtimes ==="
 
 RUNTIME_ARNS=()
 for PARAM in "${SSM_PREFIX}/serve/runtime-arn" "${SSM_PREFIX}/mcp/runtime-arn"; do
@@ -148,7 +162,7 @@ fi
 
 # ── Step 2: Wait for AgentCore ENIs to detach ─────────────────────────────
 echo ""
-echo "=== Step 2/5: Wait for AgentCore Runtime ENIs to detach ==="
+echo "=== Step 2/6: Wait for AgentCore Runtime ENIs to detach ==="
 
 if [ ${#AGENTCORE_SG_IDS[@]} -eq 0 ]; then
   ok "No AgentCore security groups found — nothing to wait on."
@@ -208,7 +222,7 @@ fi
 
 # ── Step 3: Delete VKG ECS services and wait ──────────────────────────────
 echo ""
-echo "=== Step 3/5: Delete VKG cluster services ==="
+echo "=== Step 3/6: Delete VKG cluster services ==="
 
 VKG_CLUSTER="${STACK_PREFIX}-vkg-cluster"
 SERVICE_ARNS=()
@@ -290,11 +304,107 @@ else
   done
 fi
 
-# ── Step 4: Delete the DataZone domain (force-cascades to child projects,
+# ── Step 4: Delete Cloud Map services (CFN owns the namespace, not the
+# services registered inside it) ──────────────────────────────────────────
+echo ""
+echo "=== Step 4/6: Delete Cloud Map services ==="
+
+# Scoped by namespace NAME, which carries the prefix and env
+# (`${this.prefixed("services")}.local` in network-stack.ts). Service names
+# inside the namespace are per-SCL-namespace and carry no prefix, so filtering
+# by name would be wrong — and with two deployments in one account it could
+# match the other one's services. Always filter by namespace id.
+CLOUDMAP_NS_NAME="${STACK_PREFIX}-services.local"
+CLOUDMAP_NS_ID=$(aws servicediscovery list-namespaces --region "$REGION" \
+  --query "Namespaces[?Name=='${CLOUDMAP_NS_NAME}'].Id | [0]" \
+  --output text 2>/dev/null || echo "")
+
+if [ -z "$CLOUDMAP_NS_ID" ] || [ "$CLOUDMAP_NS_ID" == "None" ]; then
+  ok "No Cloud Map namespace '${CLOUDMAP_NS_NAME}' — nothing to clean up."
+else
+  info "Namespace $CLOUDMAP_NS_NAME ($CLOUDMAP_NS_ID)"
+  CLOUDMAP_SERVICE_IDS=()
+  while IFS= read -r SVC_ID; do
+    [ -n "$SVC_ID" ] && CLOUDMAP_SERVICE_IDS+=("$SVC_ID")
+  done < <(aws servicediscovery list-services --region "$REGION" \
+    --filters "Name=NAMESPACE_ID,Values=${CLOUDMAP_NS_ID},Condition=EQ" \
+    --query 'Services[].Id' --output text 2>/dev/null | tr '\t' '\n')
+
+  if [ ${#CLOUDMAP_SERVICE_IDS[@]} -eq 0 ]; then
+    ok "No Cloud Map services registered — CFN can delete the namespace."
+  else
+    info "${#CLOUDMAP_SERVICE_IDS[@]} service(s) to remove"
+    CLOUDMAP_FAILED=0
+    for SVC_ID in "${CLOUDMAP_SERVICE_IDS[@]}"; do
+      # Deregister every instance first: DeleteService returns
+      # ResourceInUse while any instance is still registered. ECS normally
+      # deregisters its own instances when tasks stop (Step 3), but a service
+      # whose tasks were already gone, or one registered by something other
+      # than ECS, can still hold instances.
+      while IFS= read -r INSTANCE_ID; do
+        [ -z "$INSTANCE_ID" ] && continue
+        if aws servicediscovery deregister-instance --region "$REGION" \
+            --service-id "$SVC_ID" --instance-id "$INSTANCE_ID" >/dev/null 2>&1; then
+          info "  deregistered $INSTANCE_ID from $SVC_ID"
+        else
+          warn "  could not deregister $INSTANCE_ID from $SVC_ID"
+        fi
+      done < <(aws servicediscovery list-instances --region "$REGION" \
+        --service-id "$SVC_ID" --query 'Instances[].Id' --output text 2>/dev/null | tr '\t' '\n')
+
+      # Deregistration is asynchronous, so retry the delete until the
+      # instance count actually reaches zero rather than deleting once and
+      # hoping. Bounded so a stuck service cannot hang the teardown.
+      DEADLINE=$(( $(date +%s) + CLOUDMAP_WAIT_MAX_SECONDS ))
+      while true; do
+        DEL_ERR=$(mktemp)
+        if aws servicediscovery delete-service --region "$REGION" \
+            --id "$SVC_ID" >/dev/null 2>"$DEL_ERR"; then
+          ok "Deleted Cloud Map service $SVC_ID"
+          rm -f "$DEL_ERR"
+          break
+        fi
+        DEL_STDERR=$(cat "$DEL_ERR"); rm -f "$DEL_ERR"
+
+        # Already gone (concurrent teardown, or a previous run) is success.
+        if echo "$DEL_STDERR" | grep -q "ServiceNotFound"; then
+          ok "Cloud Map service $SVC_ID already gone"
+          break
+        fi
+        if ! echo "$DEL_STDERR" | grep -q "ResourceInUse"; then
+          warn "delete-service failed for $SVC_ID: $DEL_STDERR"
+          CLOUDMAP_FAILED=$((CLOUDMAP_FAILED + 1))
+          break
+        fi
+        if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+          COUNT=$(aws servicediscovery get-service --region "$REGION" --id "$SVC_ID" \
+            --query 'Service.InstanceCount' --output text 2>/dev/null || echo "?")
+          warn "Cloud Map service $SVC_ID still has $COUNT instance(s) after ${CLOUDMAP_WAIT_MAX_SECONDS}s."
+          CLOUDMAP_FAILED=$((CLOUDMAP_FAILED + 1))
+          break
+        fi
+        info "  $SVC_ID still in use, waiting 10s..."
+        sleep 10
+      done
+    done
+
+    if [ "$CLOUDMAP_FAILED" -gt 0 ]; then
+      warn "$CLOUDMAP_FAILED Cloud Map service(s) could not be deleted."
+      warn "'cdk destroy' will leave the network stack in DELETE_FAILED on"
+      warn "DeleteNamespace while any service remains. Inspect with:"
+      warn "  aws servicediscovery list-services --region $REGION \\"
+      warn "    --filters Name=NAMESPACE_ID,Values=${CLOUDMAP_NS_ID},Condition=EQ"
+    else
+      ok "All Cloud Map services removed."
+    fi
+  fi
+fi
+
+# ── Step 5: Delete the DataZone domain (force-cascades to child projects,
 # assets, and asset types that CFN's own DeleteDomain/DeleteProject calls
 # cannot clear on their own) ──────────────────────────────────────────────
 echo ""
-echo "=== Step 4/5: Delete DataZone domain ==="
+echo "=== Step 5/6: Delete DataZone domain ==="
 
 DOMAIN_ID=$(aws ssm get-parameter --name "${SSM_PREFIX}/smus/domain-id" \
   --region "$REGION" --query 'Parameter.Value' --output text 2>/dev/null || echo "")
@@ -388,7 +498,7 @@ fi
 
 # ── Step 5: cdk destroy --all, then verify ────────────────────────────────
 echo ""
-echo "=== Step 5/5: cdk destroy --all ==="
+echo "=== Step 6/6: cdk destroy --all ==="
 echo "CDK context: $CONTEXT"
 pnpm --filter coa-infra exec cdk destroy --all $CONTEXT --force
 DESTROY_EXIT=$?

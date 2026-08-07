@@ -29,6 +29,8 @@ from unittest.mock import patch
 import pytest
 from fastapi import HTTPException
 
+pytestmark = pytest.mark.unit
+
 # Replicate the fixed function logic inline for testing
 _FETCH_ALLOWED_SCHEMES = {"https"}
 

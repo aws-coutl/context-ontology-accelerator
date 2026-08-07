@@ -5,7 +5,10 @@
 
 from __future__ import annotations
 
+import pytest
 from coa_metrics.constants import VALID_SQL_DIALECTS, dialect_hint, invalid_dialect_message
+
+pytestmark = pytest.mark.unit
 
 
 class TestDialectHint:
@@ -35,7 +38,13 @@ class TestInvalidDialectMessage:
     def test_unknown_dialect_has_no_hint(self):
         msg = invalid_dialect_message("ORACLE")
         assert "ORACLE" in msg
-        assert "TRINO" not in msg
+        # Assert on the absence of the HINT, not of the word "TRINO": the base
+        # message always lists every valid dialect (see
+        # test_base_message_lists_valid_dialects), TRINO among them, so
+        # `"TRINO" not in msg` can never hold and contradicted that test.
+        assert dialect_hint("ORACLE") is None
+        assert "use TRINO" not in msg
+        assert "(" not in msg, f"expected no hint suffix, got: {msg}"
 
     def test_base_message_lists_valid_dialects(self):
         msg = invalid_dialect_message("ATHENA")

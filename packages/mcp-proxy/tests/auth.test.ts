@@ -11,9 +11,15 @@ import { join } from "node:path";
 const CACHE_DIR = mkdtempSync(join(tmpdir(), "coa-mcp-proxy-test-"));
 process.env.SCL_CACHE_DIR = CACHE_DIR;
 
-const { loadCache, saveCache, discoverEndpoints, refreshToken, getToken } = await import(
-  "../src/auth.js"
-);
+const {
+  loadCache,
+  saveCache,
+  discoverEndpoints,
+  refreshToken,
+  getToken,
+  isSafeBrowserUrl,
+  browserOpenCommand,
+} = await import("../src/auth.js");
 
 const CACHE_FILE = join(CACHE_DIR, "tokens.json");
 
@@ -202,5 +208,98 @@ describe("getToken", () => {
 
     const token = await getToken("client", "https://idp");
     expect(token).toBe("idt2");
+  });
+});
+
+describe("isSafeBrowserUrl", () => {
+  it("accepts the http(s) authorization URLs the PKCE flow builds", () => {
+    expect(isSafeBrowserUrl("https://idp.example.com/oauth2/authorize?response_type=code")).toBe(
+      true,
+    );
+    expect(isSafeBrowserUrl("http://localhost:9876/oauth/callback")).toBe(true);
+  });
+
+  it("allows percent-encoding, which a real redirect_uri parameter requires", () => {
+    expect(
+      isSafeBrowserUrl(
+        "https://idp.example.com/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A9876%2Foauth%2Fcallback",
+      ),
+    ).toBe(true);
+  });
+
+  it.each([
+    ["a non-http scheme", "file:///etc/passwd"],
+    ["a javascript: URL", "javascript:alert(1)"],
+    ["a relative/unparseable value", "not-a-url"],
+    ["an empty string", ""],
+  ])("rejects %s", (_label, url) => {
+    expect(isSafeBrowserUrl(url)).toBe(false);
+  });
+
+  it("rejects quotes and newlines that could split an OS command line", () => {
+    expect(isSafeBrowserUrl('https://idp.example.com/a"b')).toBe(false);
+    expect(isSafeBrowserUrl("https://idp.example.com/a'b")).toBe(false);
+    expect(isSafeBrowserUrl("https://idp.example.com/a\nb")).toBe(false);
+  });
+
+  it.each([
+    ["backtick", "https://idp.example.com/a`b"],
+    ["subexpression", "https://idp.example.com/$(x)"],
+    ["semicolon", "https://idp.example.com/a;b"],
+    ["pipe", "https://idp.example.com/a|b"],
+  ])(
+    "still allows %s — safety comes from argv separation, not this denylist",
+    (_label, url) => {
+      // Documents the intentional limit: these are shell/PowerShell
+      // metacharacters, and the URL is never passed through a shell or a
+      // PowerShell script string (see browserOpenCommand), so they are inert.
+      expect(isSafeBrowserUrl(url)).toBe(true);
+    },
+  );
+});
+
+describe("browserOpenCommand", () => {
+  // A realistic authorization URL: no space/tab/quote (so Windows argv
+  // flattening would NOT quote it) but several `&` characters.
+  const OAUTH_URL =
+    "https://idp.example.com/oauth2/authorize?response_type=code&client_id=abc" +
+    "&redirect_uri=http%3A%2F%2Flocalhost%3A9876%2Foauth%2Fcallback&state=xyz" +
+    "&code_challenge=c1&code_challenge_method=S256";
+
+  it.each([
+    ["darwin", "open"],
+    ["win32", "rundll32.exe"],
+    ["linux", "xdg-open"],
+  ])("uses the %s opener", (platform, expected) => {
+    const [command] = browserOpenCommand(platform, OAUTH_URL);
+    expect(command).toBe(expected);
+  });
+
+  it.each(["darwin", "win32", "linux"])(
+    "passes the URL as its own argv entry on %s (never re-tokenized)",
+    (platform) => {
+      const [, args] = browserOpenCommand(platform, OAUTH_URL);
+      // Exactly one argv slot equals the URL verbatim — nothing concatenates it
+      // into a larger string that a shell or script parser would re-split.
+      expect(args.filter((a) => a === OAUTH_URL)).toHaveLength(1);
+      expect(args.some((a) => a !== OAUTH_URL && a.includes(OAUTH_URL))).toBe(false);
+    },
+  );
+
+  it("does not invoke cmd.exe or powershell on win32", () => {
+    // Regression guard. `cmd /c start` re-parses its arguments, and
+    // `powershell -Command Start-Process -FilePath <url>` fails outright: Node
+    // flattens argv on Windows and only quotes args containing space/tab/quote,
+    // so the URL's `&` characters reach PowerShell unquoted, where `&` is the
+    // reserved call operator.
+    const [command, args] = browserOpenCommand("win32", OAUTH_URL);
+    const line = [command, ...args].join(" ").toLowerCase();
+    expect(line).not.toContain("cmd");
+    expect(line).not.toContain("powershell");
+    expect(args).toEqual(["url.dll,FileProtocolHandler", OAUTH_URL]);
+  });
+
+  it("defaults unknown platforms to xdg-open", () => {
+    expect(browserOpenCommand("freebsd", OAUTH_URL)[0]).toBe("xdg-open");
   });
 });

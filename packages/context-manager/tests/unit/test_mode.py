@@ -17,6 +17,8 @@ import pytest
 from coa_serve.clients.sources_registry import SourceComposition
 from coa_serve.mode import Composition, Mode, ResolutionPlan, build_plan, resolve_mode
 
+pytestmark = pytest.mark.unit
+
 
 def _legacy_is_agentic_engaged(request_mode, *, agentic_retriever_exists, tier3_agentic_default):
     """Transcription of Orchestrator._is_agentic_engaged (pre-mode-module)."""

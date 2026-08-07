@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
 from coa_common.constants import GRAPH_BASE_URI
 from coa_ontology.inducer.services.grounding import (
     GroundingCandidate,
@@ -27,6 +28,8 @@ from coa_ontology.inducer.unstructured.services.class_grounding import (
 )
 from rdflib import OWL, RDF, RDFS, Graph, Literal, URIRef
 from rdflib.namespace import SKOS
+
+pytestmark = pytest.mark.unit
 
 _PREFIX = f"{GRAPH_BASE_URI}/namespace/ns/ontology/induced#"
 _CLASS_IRI = f"{GRAPH_BASE_URI}/namespace/ns/ontology/induced#FinancialInstrument"

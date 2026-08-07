@@ -15,6 +15,8 @@ from coa_serve.tier2.ontop.nl_to_sparql import (
 )
 from coa_serve.tier2.ontop.types import VectorHit
 
+pytestmark = pytest.mark.unit
+
 
 def _make_graph_client(query_results=None):
     client = AsyncMock()

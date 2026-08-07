@@ -19,6 +19,8 @@ from botocore.exceptions import ClientError, ConnectTimeoutError, ReadTimeoutErr
 from coa_common import embeddings
 from coa_common.embeddings import BedrockEmbedder, make_llama_index_embedding
 
+pytestmark = pytest.mark.unit
+
 
 def _mock_bedrock(response: dict) -> MagicMock:
     client = MagicMock()

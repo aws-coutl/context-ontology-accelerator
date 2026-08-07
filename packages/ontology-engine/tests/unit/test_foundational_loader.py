@@ -38,6 +38,8 @@ import pytest
 from coa_control_plane_server.models.ingest_job_state import IngestJobState
 from fastapi import HTTPException
 
+pytestmark = pytest.mark.unit
+
 
 def _stub_ingest_result() -> dict:
     """Shape of ``ingest_ontology``'s return value the loader inspects."""

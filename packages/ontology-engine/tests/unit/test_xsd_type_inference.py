@@ -7,6 +7,8 @@ import pytest
 from coa_ontology.inducer.strategies.base import xsd_for, xsd_for_column
 from rdflib import XSD
 
+pytestmark = pytest.mark.unit
+
 
 class TestXsdFor:
     """Original xsd_for behavior unchanged."""

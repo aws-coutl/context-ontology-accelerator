@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
 import structlog
 
@@ -46,10 +47,25 @@ def _extract_graph_id(endpoint: str) -> str | None:
 
 
 def _is_neptune_analytics(endpoint: str) -> bool:
-    """Return True if *endpoint* refers to a Neptune Analytics graph."""
+    """Return True if *endpoint* refers to a Neptune Analytics graph.
+
+    The service-host test is anchored to the end of the host so a value such as
+    ``neptune-graph.amazonaws.com.other.test`` is not treated as Neptune
+    Analytics. This picks which client to construct, not whether to trust the
+    endpoint, but keeping the match host-anchored avoids routing traffic to the
+    wrong backend on a malformed config value.
+    """
     if endpoint.startswith("neptune-graph://"):
         return True
-    if "neptune-graph.amazonaws.com" in endpoint:
+    try:
+        host = (urlsplit(endpoint if "://" in endpoint else f"//{endpoint}").hostname or "").lower()
+    except ValueError:
+        # ``hostname`` raises on an unparseable netloc (stray brackets, or
+        # characters that fail NFKC normalization). Such a value cannot be a real
+        # NA host, so fall through to the graph-id heuristic rather than failing
+        # client construction at startup.
+        host = ""
+    if host == "neptune-graph.amazonaws.com" or host.endswith(".neptune-graph.amazonaws.com"):
         return True
     # A bare or embedded graph-id (g-…) with no NDB port indicator
     return bool(_extract_graph_id(endpoint) and ":8182" not in endpoint)

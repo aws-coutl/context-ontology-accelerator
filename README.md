@@ -23,8 +23,15 @@ Access is governed by namespace isolation and role-based access control: namespa
 
 ### Setup
 
+> **Use a release, not the tip of `main`.** We recommend starting from a tagged
+> release — [github.com/aws/context-ontology-accelerator/releases](https://github.com/aws/context-ontology-accelerator/releases).
+> `main` tracks ongoing development.
+
 ```bash
-git clone <repo-url> && cd coa
+# Clone at the latest release tag (replace <tag> with a release from the link above)
+git clone --branch <tag> https://github.com/aws/context-ontology-accelerator.git
+cd context-ontology-accelerator
+
 make setup      # install Python + CDK TypeScript dependencies
 make format     # auto-format code
 make lint       # check linting
@@ -73,7 +80,7 @@ semantic-context/
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for coding standards, how to add a new package, and the PR process.
+This repository is published as a read-only mirror. We are not accepting pull requests at this time. You are welcome to report bugs and share feedback through GitHub Issues. See [CONTRIBUTING.md](CONTRIBUTING.md) for details including direction for Amazon employees.
 
 ## External Dependencies
 

@@ -11,6 +11,8 @@ from coa_serve.config import ServiceConfig
 from coa_serve.models import ConfidenceScore, InvokeRequest, InvokeResponse, QueryResult, TraceStep
 from coa_serve.orchestrator import Orchestrator
 
+pytestmark = pytest.mark.unit
+
 HAS_AGENTCORE = importlib.util.find_spec("bedrock_agentcore") is not None
 
 agentcore_required = pytest.mark.skipif(not HAS_AGENTCORE, reason="bedrock_agentcore SDK not installed")
@@ -417,7 +419,9 @@ class TestInvokeFunction:
             }
         )
 
-        mock_resolve.assert_called_once_with("user@example.com", ["team-a"], namespace="demo")
+        # email="" because there is no JWT on this path — profile.email is
+        # attacker-controlled and must NOT be promoted to a grant lookup key.
+        mock_resolve.assert_called_once_with("user@example.com", ["team-a"], namespace="demo", email="")
         mock_resolved.inject_into.assert_called_once()
 
     @patch("coa_serve.main._ensure_initialized")
@@ -489,7 +493,64 @@ class TestInvokeFunction:
             }
         )
 
-        mock_resolve.assert_called_once_with("user@example.com", ["team-a", "team-b", "team-c"], namespace="demo")
+        mock_resolve.assert_called_once_with(
+            "user@example.com", ["team-a", "team-b", "team-c"], namespace="demo", email=""
+        )
+
+    @patch("coa_serve.main.extract_jwt_identity")
+    @patch("coa_serve.main._ensure_initialized")
+    @patch("coa_serve.main.resolve_profile")
+    async def test_invoke_threads_jwt_email_when_sub_differs(
+        self, mock_resolve, mock_init, mock_jwt, stub_orchestrator, config
+    ):
+        """Cognito issues a UUID 'sub' while grants are keyed by email. The JWT
+        email must be threaded to resolve_profile so the email-keyed grant is
+        still found — otherwise Cedar fails closed on a legitimately granted user.
+        """
+
+        mock_init.return_value = None
+        mock_resolved = MagicMock()
+        mock_resolved.inject_into = MagicMock()
+        mock_resolve.return_value = mock_resolved
+        # (sub, email, groups) as returned from a validated Cognito JWT
+        mock_jwt.return_value = ("9f8e7d6c-1234-4abc-9def-0123456789ab", "user@example.com", ["team-a"])
+
+        await _invoke_collect({"query": "how many orders", "namespace": "demo"}, context=MagicMock())
+
+        mock_resolve.assert_called_once_with(
+            "9f8e7d6c-1234-4abc-9def-0123456789ab",
+            ["team-a"],
+            namespace="demo",
+            email="user@example.com",
+        )
+
+    @patch("coa_serve.main.extract_jwt_identity")
+    @patch("coa_serve.main._ensure_initialized")
+    @patch("coa_serve.main.resolve_profile")
+    async def test_invoke_ignores_profile_email_when_jwt_present(
+        self, mock_resolve, mock_init, mock_jwt, stub_orchestrator, config
+    ):
+        """The request body is attacker-controlled. A client-supplied profile.email
+        must never become the grant lookup key when a validated JWT is present —
+        otherwise a caller could impersonate another principal's email grants.
+        """
+
+        mock_init.return_value = None
+        mock_resolved = MagicMock()
+        mock_resolved.inject_into = MagicMock()
+        mock_resolve.return_value = mock_resolved
+        mock_jwt.return_value = ("sub-uuid", "real@example.com", [])
+
+        await _invoke_collect(
+            {
+                "query": "test",
+                "namespace": "demo",
+                "profile": {"email": "admin@example.com", "userId": "admin@example.com"},
+            },
+            context=MagicMock(),
+        )
+
+        mock_resolve.assert_called_once_with("sub-uuid", [], namespace="demo", email="real@example.com")
 
 
 @agentcore_required

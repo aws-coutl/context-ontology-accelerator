@@ -14,6 +14,8 @@ from coa_ontology.inducer.services.grounding import (
     _normalize,
 )
 
+pytestmark = pytest.mark.unit
+
 
 @pytest.fixture
 def mock_catalog():

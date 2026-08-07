@@ -112,21 +112,35 @@ class ResolvedProfile:
     user_id: str = ""
     global_roles: list[str] = field(default_factory=list)
     resource_roles: list[dict[str, str]] = field(default_factory=list)
-    table_allowlist: list[str] = field(default_factory=list)
-    column_denylist: dict[str, list[str]] = field(default_factory=dict)
-    data_source_ids: list[str] = field(default_factory=list)
+    # None = unrestricted (no grant declares a constraint). An explicitly EMPTY
+    # list/map is a real restriction (deny-all) under the SQL firewall's
+    # empty-vs-absent semantics, so the two must not be collapsed here.
+    table_allowlist: list[str] | None = None
+    column_denylist: dict[str, list[str]] | None = None
+    data_source_ids: list[str] | None = None
 
     def to_profile_dict(self) -> dict:
-        """Convert to the dict format expected by InvokeRequest.profile."""
-        return {
+        """Convert to the dict format expected by InvokeRequest.profile.
+
+        Restriction keys are omitted when unrestricted (None) rather than sent
+        as empty lists: an empty tableAllowlist now means deny-all to the SQL
+        firewall, and the serve entrypoint strips + re-resolves these fields
+        server-side anyway — forwarding fabricated empties only trips its
+        client_role_injection_stripped warning on every call.
+        """
+        profile: dict = {
             "namespace": self.namespace,
             "userId": self.user_id,
             "globalRoles": self.global_roles,
             "resourceRoles": self.resource_roles,
-            "tableAllowlist": self.table_allowlist,
-            "columnDenylist": self.column_denylist,
-            "dataSourceIds": self.data_source_ids,
         }
+        if self.table_allowlist is not None:
+            profile["tableAllowlist"] = self.table_allowlist
+        if self.column_denylist is not None:
+            profile["columnDenylist"] = self.column_denylist
+        if self.data_source_ids is not None:
+            profile["dataSourceIds"] = self.data_source_ids
+        return profile
 
 
 async def resolve_grant(
@@ -192,25 +206,28 @@ async def resolve_grant(
             namespace=namespace_id,
         )
     except Exception as e:
-        # If role resolution fails but user is admin, allow with empty restrictions
-        if "Admin" in caller.roles or "admin" in caller.roles:
-            logger.warning(
-                "grant_resolution_failed_admin_fallback",
-                user_id=caller.user_id,
-                namespace=namespace_id,
-                error=str(e),
-            )
-            return ResolvedProfile(
-                namespace=namespace_id,
-                user_id=caller.user_id,
-                global_roles=["platform-admin"],
-                resource_roles=[{"role": "namespace-owner", "resourceUID": namespace_id}],
-            )
-
+        # Fail closed for EVERY caller, admins included.
+        #
+        # There used to be an admin fallback here that returned platform-admin +
+        # namespace-owner and returned EARLY — before the Cedar evaluation below,
+        # despite that block's comment claiming it is never bypassed. It granted
+        # those roles off nothing but an "admin" entry in the caller's IdP groups,
+        # with no policy check and no data restrictions.
+        #
+        # It was near-unreachable while resolve_profile swallowed its own query
+        # errors, but that method now propagates them (a partial grant read is more
+        # permissive than the truth, so degrading there widened data access). A
+        # DynamoDB throttle would therefore have escalated any admin-group caller.
+        #
+        # A failed grant read means we do not know what this caller may do, which is
+        # never a reason to assume the most privileged answer. Denying turns a
+        # transient backend error into a retryable failure instead of a silent
+        # privilege escalation.
         logger.error(
             "grant_resolution_failed",
             user_id=caller.user_id,
             namespace=namespace_id,
+            is_admin_group_member=any(r.lower() == "admin" for r in caller.roles),
             error=str(e),
         )
         raise GrantResolutionError(f"Failed to resolve grant for user '{caller.user_id}': {e}") from e
@@ -240,7 +257,9 @@ async def resolve_grant(
         user_id=caller.user_id,
         global_roles=resolved.global_roles,
         resource_roles=resolved.resource_roles,
-        table_allowlist=resolved.table_allowlist or [],
-        column_denylist=resolved.column_denylist or {},
-        data_source_ids=resolved.allowed_metrics or [],
+        # Pass through as-is: None (unrestricted) must not become [] — an empty
+        # list is a deny-all restriction under the firewall's semantics.
+        table_allowlist=resolved.table_allowlist,
+        column_denylist=resolved.column_denylist,
+        data_source_ids=resolved.allowed_metrics,
     )

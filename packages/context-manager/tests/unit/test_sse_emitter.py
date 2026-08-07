@@ -11,6 +11,8 @@ import pytest
 from coa_serve.models import ConfidenceScore, QueryResult, TraceStep
 from coa_serve.sse_emitter import SSEEmitter
 
+pytestmark = pytest.mark.unit
+
 
 class TestSSEEmitterEnvelope:
     """Validate event envelope structure."""

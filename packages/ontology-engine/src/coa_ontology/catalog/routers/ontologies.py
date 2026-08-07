@@ -28,6 +28,7 @@ also powers ``POST /ontology/proposals/{id}/accept``.
 """
 
 import contextlib
+import hashlib
 import ipaddress
 import logging
 import os
@@ -88,6 +89,25 @@ log = logging.getLogger(__name__)
 
 
 ONTOLOGY_STORAGE_PATH = os.getenv("ONTOLOGY_STORAGE_PATH", "./data/ontologies")
+
+
+def _is_within_storage_root(candidate: str) -> bool:
+    """True when *candidate* resolves to a path inside ``ONTOLOGY_STORAGE_PATH``.
+
+    Compares path components via ``os.path.commonpath`` rather than a string
+    prefix: ``startswith`` would accept a sibling directory whose name merely
+    begins with the root (``/data/ontologies-evil`` for a root of
+    ``/data/ontologies``), which a symlink inside the root can resolve to.
+    """
+    root = os.path.realpath(ONTOLOGY_STORAGE_PATH)
+    real = os.path.realpath(candidate)
+    if real == root:
+        return True
+    try:
+        return os.path.commonpath([root, real]) == root
+    except ValueError:
+        # Mixed absolute/relative or different drives — cannot be inside.
+        return False
 
 
 def _stores(namespace: str | None) -> tuple[GraphStore, VectorStore]:
@@ -263,7 +283,7 @@ def download_ontology_file(ontology_id: str, namespace: str = "default"):
         )
     # SECURITY: ensure file path is within the allowed storage directory
     real_fp = os.path.realpath(fp)
-    if not real_fp.startswith(os.path.realpath(ONTOLOGY_STORAGE_PATH)):
+    if not _is_within_storage_root(real_fp):
         raise HTTPException(403, "Access denied: file path outside storage boundary")
     log.info("download: serving local-file fallback %s for %s in %s", fp, ontology_id, namespace)
     return FileResponse(real_fp, media_type="text/turtle", filename="ontology.ttl")
@@ -748,6 +768,19 @@ def upload_ontology_file(
     ``ontology_id`` a second time returns ``409 Conflict``. To replace
     an ontology, ``DELETE /ontologies/{ontology_id}`` first and then
     re-upload.
+
+    SECURITY — read before exposing this route. ``namespace`` is a ``Form``
+    field, so it is read from the multipart **body** and is NOT bound to the
+    Cedar-authorized ``{namespaceId}`` path parameter. This route is currently
+    unreachable (absent from ``infra/bin/app.ts`` route wiring, from the
+    authorizer's ``_PATH_MAPPING``, and from ``api_proxy_handler._PATH_MAP``),
+    which is the only thing preventing a caller authorized on namespace A from
+    writing into namespace B's storage dir, graph, and registry. Before wiring
+    it, switch ``namespace`` to ``Query(...)`` — ``api_proxy_handler`` already
+    overwrites ``query["namespace"]`` with the authorized ``namespaceId`` — or
+    reject a body value that disagrees with the authorized one. The sibling
+    ``/upload-url`` route takes ``namespace`` as a query param for exactly this
+    reason.
     """
     # Fail fast on a duplicate upload before writing the file to disk,
     # so a repeat call doesn't leave an orphaned copy on the filesystem.
@@ -960,7 +993,7 @@ def fetch_ontology_from_source(
     safe_id = re.sub(r"[^A-Za-z0-9._-]+", "_", ontology_id)[:200] or "ontology"
     file_dest = os.path.join(ONTOLOGY_STORAGE_PATH, f"{safe_id}.ttl")
     real_dest = os.path.realpath(file_dest)
-    if not real_dest.startswith(os.path.realpath(ONTOLOGY_STORAGE_PATH)):
+    if not _is_within_storage_root(real_dest):
         raise HTTPException(400, "Invalid ontology_id")
     with open(real_dest, "wb") as f:
         f.write(content)
@@ -1218,17 +1251,46 @@ def _persist_upload(namespace: str, identifier: str, content: bytes, fmt: str) -
     Returns the destination path. File name is a slugified version of the
     ontology id so the path stays filesystem-safe.
     """
-    # SECURITY: reject path traversal characters in namespace
-    if not re.match(r"^[a-zA-Z0-9_\-]+$", namespace):
+    # SECURITY: reject path traversal characters in namespace. ``fullmatch`` (not
+    # ``match`` + ``$``) because ``$`` also matches just before a trailing
+    # newline, which would let ``"ns\n"`` through.
+    if not re.fullmatch(r"[a-zA-Z0-9_\-]+", namespace):
         raise ValueError(f"Invalid namespace: {namespace!r}")
-    ns_dir = os.path.realpath(os.path.join(ONTOLOGY_STORAGE_PATH, namespace))
-    if not ns_dir.startswith(os.path.realpath(ONTOLOGY_STORAGE_PATH)):
+    root = os.path.realpath(ONTOLOGY_STORAGE_PATH)
+    ns_dir = os.path.realpath(os.path.join(root, namespace))
+    if not _is_within_storage_root(ns_dir):
         raise ValueError(f"Path traversal detected in namespace: {namespace!r}")
     os.makedirs(ns_dir, exist_ok=True)
-    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", identifier)[:200] or "ontology"
+
+    # Reduce the caller-supplied ontology id to a filesystem-safe slug. The
+    # substitution maps every path separator to ``_``, and the resolved-dest
+    # check below is the actual containment guarantee — so the FULL id is kept
+    # rather than just its basename. Ontology ids are IRIs, and many differ only
+    # before the last ``/`` (``https://schema.org/`` vs
+    # ``http://purl.org/dc/terms/``); slugifying only the basename would collapse
+    # them onto one filename and each upload would overwrite the last.
+    full_slug = re.sub(r"[^A-Za-z0-9._-]+", "_", identifier)
+    if len(full_slug) > 200:
+        # Truncation alone would merge any two ids sharing a 200-char prefix, so
+        # the truncated form carries a digest of the full id. Only applied when
+        # truncation actually happens, to keep the (overwhelmingly common) short
+        # ids at their natural filenames.
+        digest = hashlib.sha256(identifier.encode()).hexdigest()[:12]
+        slug = f"{full_slug[:187]}-{digest}"
+    else:
+        slug = full_slug
+    # A slug of only dots would combine with the extension into a name like
+    # ``...ttl``; harmless, but meaningless as a filename.
+    if slug.strip(".") == "":
+        slug = "ontology"
     ext_map = {"turtle": "ttl", "rdf-xml": "xml", "owl-xml": "xml", "json-ld": "jsonld"}
     ext = ext_map.get((fmt or "turtle").lower(), "ttl")
-    dest = os.path.join(ns_dir, f"{slug}.{ext}")
+
+    dest = os.path.realpath(os.path.join(ns_dir, f"{slug}.{ext}"))
+    # Final belt-and-braces containment check on the resolved file path — this
+    # is the value that actually reaches ``open()``.
+    if os.path.dirname(dest) != ns_dir:
+        raise ValueError(f"Path traversal detected in ontology id: {identifier!r}")
     with open(dest, "wb") as f:
         f.write(content)
     return dest

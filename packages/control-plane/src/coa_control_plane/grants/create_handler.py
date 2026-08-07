@@ -163,13 +163,14 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
             "grantedAt": now,
         }
 
-        # Optional overrides
-        if body.get("tableAllowlist"):
-            item["tableAllowlist"] = body["tableAllowlist"]
-        if body.get("columnDenylist"):
-            item["columnDenylist"] = body["columnDenylist"]
-        if body.get("allowedMetrics"):
-            item["allowedMetrics"] = body["allowedMetrics"]
+        # Optional overrides — persisted when PRESENT (`is not None`), not when
+        # truthy. An explicitly empty tableAllowlist means "no tables permitted"
+        # (a deny-all restriction the SQL firewall enforces); dropping it here
+        # would silently create a grant MORE permissive than the caller asked
+        # for. Absence (None / key omitted) still means unrestricted.
+        for opt in ("tableAllowlist", "columnDenylist", "allowedMetrics"):
+            if body.get(opt) is not None:
+                item[opt] = body[opt]
 
         # 3. Write with condition to prevent duplicates
         mappings_dao.put(item, condition="attribute_not_exists(PK) AND attribute_not_exists(SK)", auto_timestamp=False)

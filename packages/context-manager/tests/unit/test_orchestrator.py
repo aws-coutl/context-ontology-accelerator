@@ -391,8 +391,14 @@ class TestOrchestratorTier1:
         orch._query_executor.execute.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_empty_allowed_metrics_permits_all(self):
-        """Empty allowedMetrics list = no restriction (sparse opt-in convention)."""
+    async def test_empty_allowed_metrics_denies_all(self):
+        """SEMANTICS CHANGE — a declared-empty allowedMetrics is a deny-all restriction.
+
+        This previously asserted the opposite (empty = unrestricted), which was the
+        same empty-vs-absent collapse that made an empty tableAllowlist fail open in
+        the SQL firewall. A grant declaring ``allowedMetrics: []`` means "no metrics
+        permitted"; absence of the key still means unrestricted — see the test below.
+        """
         orch = _make_orchestrator(metric_found=True)
         orch._metric_resolver.match.return_value = MetricMatch(
             found=True,
@@ -407,14 +413,15 @@ class TestOrchestratorTier1:
             namespace="demo",
             profile={
                 "userId": "alice@example.com",
-                "allowedMetrics": [],  # empty = unrestricted
+                "allowedMetrics": [],  # declared empty = no metrics permitted
             },
         )
 
-        response = await orch.resolve(request)
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await orch.resolve(request)
 
-        assert response.result.tier == 1
-        orch._query_executor.execute.assert_awaited_once()
+        assert "allowedmetrics" in exc_info.value.reason.lower()
+        orch._query_executor.execute.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_unset_allowed_metrics_permits_all(self):

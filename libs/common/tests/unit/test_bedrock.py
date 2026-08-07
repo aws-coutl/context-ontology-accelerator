@@ -15,6 +15,8 @@ from coa_common.bedrock import (
     InputTooLargeError,
 )
 
+pytestmark = pytest.mark.unit
+
 
 class TestBedrockClient:
     @patch("coa_common.bedrock.boto3")

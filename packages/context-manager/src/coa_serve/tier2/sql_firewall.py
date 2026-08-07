@@ -255,8 +255,14 @@ class SQLFirewall:
         # Normalize to lower-case for case-insensitive comparison. SQL identifiers
         # are case-insensitive for unquoted names; the allowlist/denylist must
         # not be bypassed by varying case (e.g. `SELECT * FROM ORDERS`).
+        #
+        # ``is not None``, not truthiness: an ABSENT allowlist means "no table
+        # constraint", but an explicitly EMPTY one means "no tables permitted".
+        # Collapsing the two made a deny-all grant fail OPEN — the empty list was
+        # falsy, so the restriction was dropped and the unrestricted path below
+        # allowed every table.
         allowlist: set[str] | None = None
-        if allowlist_raw:
+        if allowlist_raw is not None:
             try:
                 allowlist = {str(t).lower() for t in allowlist_raw}
             except TypeError:
@@ -275,7 +281,10 @@ class SQLFirewall:
         # orchestration boundary only bites on a RESTRICTIVE profile). The Cedar
         # policy gate below still runs regardless, since it is namespace/role
         # based rather than keyed off the sparse table profile.
-        if not allowlist and not denylist:
+        #
+        # ``allowlist is None`` rather than ``not allowlist``: an empty allowlist is
+        # a restriction (deny every table), not the absence of one.
+        if allowlist is None and not denylist:
             logger.info("sql_firewall_evaluate", decision="allow", restricted=False)
             return self._apply_cedar(sql, namespace, profile)
 

@@ -20,6 +20,8 @@ from coa_common.constants import (
     validate_s3_prefix,
 )
 
+pytestmark = pytest.mark.unit
+
 
 class TestToGraphragTenantId:
     """Verify the namespace_id → TenantId mapping.

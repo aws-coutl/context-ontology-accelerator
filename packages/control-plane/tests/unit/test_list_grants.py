@@ -175,9 +175,13 @@ class TestListGrantsToGrantSummary:
         assert "allowedMetrics" not in grant
 
     @patch("coa_control_plane.grants.list_handler.DynamoDBDAO")
-    def test_empty_overrides_are_omitted(self, mock_dao_cls):
-        """Empty list/dict are falsy and treated as absent — keeps response payloads
-        compact and consistent with the omit-when-unset write-side behavior."""
+    def test_declared_empty_overrides_are_returned(self, mock_dao_cls):
+        """SEMANTICS CHANGE (was: empty treated as absent and omitted).
+
+        A declared-empty tableAllowlist/allowedMetrics is a deny-all restriction
+        the SQL firewall enforces; omitting it from the listing would make a
+        deny-all grant indistinguishable from an unrestricted one to reviewers.
+        """
         mock_dao = MagicMock()
         mock_dao_cls.return_value = mock_dao
         item = {
@@ -190,9 +194,9 @@ class TestListGrantsToGrantSummary:
         resp = handler(_event(), None)
         body = json.loads(resp["body"])
         grant = body["grants"][0]
-        assert "tableAllowlist" not in grant
-        assert "columnDenylist" not in grant
-        assert "allowedMetrics" not in grant
+        assert grant["tableAllowlist"] == []
+        assert grant["columnDenylist"] == {}
+        assert grant["allowedMetrics"] == []
 
     @patch("coa_control_plane.grants.list_handler.DynamoDBDAO")
     def test_partial_overrides_only_set_fields_returned(self, mock_dao_cls):

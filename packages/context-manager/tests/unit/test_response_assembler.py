@@ -7,6 +7,8 @@ import pytest
 from coa_serve.response_assembler import ResponseAssembler
 from coa_serve.trace import TraceCollector
 
+pytestmark = pytest.mark.unit
+
 
 @pytest.fixture
 def assembler():

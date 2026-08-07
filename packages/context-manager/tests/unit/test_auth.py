@@ -6,7 +6,10 @@
 from unittest.mock import MagicMock
 
 import jwt
+import pytest
 from coa_serve.auth import TokenClaims
+
+pytestmark = pytest.mark.unit
 
 
 def _make_token(claims: dict) -> str:

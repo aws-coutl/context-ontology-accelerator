@@ -260,3 +260,73 @@ describe("ServeStack - OE Monitoring", () => {
     expect(Object.keys(alarms).length).toBeGreaterThanOrEqual(1);
   });
 });
+
+describe("ServeStack - Athena S3 permissions", () => {
+  let template: Template;
+  beforeAll(() => {
+    template = createStack();
+  });
+
+  /**
+   * Collect every action string granted across all IAM policy statements whose
+   * resource list mentions the given substring. Statements are keyed on the
+   * bucket name rather than a policy logical id so the assertions survive
+   * refactors that move statements between policies.
+   */
+  function actionsForResource(resourceSubstring: string): string[] {
+    const policies = template.findResources("AWS::IAM::Policy");
+    const actions: string[] = [];
+    for (const policy of Object.values(policies)) {
+      const statements = policy.Properties?.PolicyDocument?.Statement ?? [];
+      for (const statement of statements) {
+        const serialized = JSON.stringify(statement.Resource ?? "");
+        if (!serialized.includes(resourceSubstring)) continue;
+        const stmtActions = Array.isArray(statement.Action)
+          ? statement.Action
+          : [statement.Action];
+        for (const action of stmtActions) {
+          if (typeof action === "string") actions.push(action);
+        }
+      }
+    }
+    return actions;
+  }
+
+  // Athena writes result files with a multipart upload once they exceed the
+  // single-PutObject threshold, and aborts the upload on failure. Small result
+  // sets never exercise this, which is why the gap only surfaced against real
+  // data — assert the actions explicitly so it cannot regress silently.
+  it("grants multipart and delete actions on the Athena results bucket", () => {
+    const actions = actionsForResource("athena-results");
+    expect(actions).toContain("s3:AbortMultipartUpload");
+    expect(actions).toContain("s3:ListMultipartUploadParts");
+    expect(actions).toContain("s3:DeleteObject");
+    expect(actions).toContain("s3:PutObject");
+  });
+
+  // The managed federated connector WRITES spill data here when results exceed
+  // Lambda memory; a read-only policy fails only on large queries.
+  it("grants write access on the Athena spill bucket", () => {
+    const actions = actionsForResource("athena-spill");
+    expect(actions).toContain("s3:PutObject");
+    expect(actions).toContain("s3:GetObject");
+    expect(actions).toContain("s3:AbortMultipartUpload");
+    expect(actions).toContain("s3:ListMultipartUploadParts");
+    expect(actions).toContain("s3:DeleteObject");
+  });
+
+  // Least privilege: the broadened S3 grants must stay scoped to the Athena
+  // buckets and must not become a wildcard on all of S3.
+  it("does not grant S3 wildcard actions", () => {
+    const policies = template.findResources("AWS::IAM::Policy");
+    for (const policy of Object.values(policies)) {
+      const statements = policy.Properties?.PolicyDocument?.Statement ?? [];
+      for (const statement of statements) {
+        const stmtActions = Array.isArray(statement.Action)
+          ? statement.Action
+          : [statement.Action];
+        expect(stmtActions).not.toContain("s3:*");
+      }
+    }
+  });
+});

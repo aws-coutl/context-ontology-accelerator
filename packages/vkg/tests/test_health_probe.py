@@ -9,6 +9,10 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+pytestmark = pytest.mark.unit
+
 # Unique module name (+ patch.object) so this never collides with
 # test_translate_contract.py, which also loads translate-server.py.
 _server_path = Path(__file__).parent.parent / "translate-server.py"

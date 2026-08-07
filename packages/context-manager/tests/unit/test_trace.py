@@ -10,6 +10,8 @@ import asyncio
 import pytest
 from coa_serve.trace import TraceCollector
 
+pytestmark = pytest.mark.unit
+
 
 @pytest.mark.asyncio
 class TestTraceCollector:
