@@ -216,6 +216,40 @@ class TestGraphStoreUriSeams:
 
         assert _is_neptune_analytics("g-abc1234567") is True
 
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
+            "g-abc1234567.us-east-1.neptune-graph.amazonaws.com",
+            "https://g-abc1234567.us-east-1.neptune-graph.amazonaws.com",
+            "neptune-graph.amazonaws.com",
+        ],
+    )
+    def test_real_na_hosts_detected(self, endpoint):
+        from coa_serve.clients.factory import _is_neptune_analytics
+
+        assert _is_neptune_analytics(endpoint) is True
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
+            # Suffix-extension look-alike: the real host is other.test.
+            "https://neptune-graph.amazonaws.com.other.test/graph",
+            # Service host present only in the path.
+            "https://other.test/neptune-graph.amazonaws.com",
+            # Label-boundary look-alike (not a ".neptune-graph…" subdomain).
+            "https://evilneptune-graph.amazonaws.com/graph",
+        ],
+    )
+    def test_na_host_match_is_anchored_to_the_host(self, endpoint):
+        """A substring test would route these to the Neptune Analytics client.
+
+        These carry no ``g-…`` graph-id, so with a host-anchored check they fall
+        through to the NDB branch instead of selecting the wrong backend.
+        """
+        from coa_serve.clients.factory import _is_neptune_analytics
+
+        assert _is_neptune_analytics(endpoint) is False
+
 
 # ── Property 4 seam gap — Tier-3 resolve-boundary degradation ───────
 

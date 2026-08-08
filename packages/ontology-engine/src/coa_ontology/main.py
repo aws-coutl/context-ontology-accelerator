@@ -68,6 +68,8 @@ logging.basicConfig(
     force=True,  # override any handler uvicorn/root already installed
 )
 
+logger = logging.getLogger(__name__)
+
 # ── App ─────────────────────────────────────────────────────────────────
 # Orphaned-job recovery is fully on-demand — the lazy ``get_job`` sweep, the
 # ``count_active_jobs`` self-heal, and ``acquire_induction_lock``'s stale-takeover
@@ -207,20 +209,28 @@ def readiness():
     Probes the configured graph store, vector store, and Bedrock embeddings
     backend. Each call performs real network I/O and may take several
     seconds — do NOT wire this to the ECS container healthcheck.
+
+    Subsystem failures are reported as a bare ``"error"`` status. The
+    exception detail is logged server-side rather than returned, because the
+    messages carry infrastructure internals (Neptune/OpenSearch endpoints,
+    role ARNs, botocore request ids) and this endpoint is reachable by any
+    caller that can hit the service.
     """
     backend = os.getenv("WORKBENCH_BACKEND", "opensearch_neptune")
 
     graph_status = "unreachable"
     try:
         graph_status = app.state.graph_store.health_check().get("status", "unknown")
-    except Exception as e:
-        graph_status = f"error: {e}"
+    except Exception:
+        logger.warning("readiness_graph_store_probe_failed", exc_info=True)
+        graph_status = "error"
 
     vector_status = "unreachable"
     try:
         vector_status = app.state.vector_store.health_check().get("status", "unknown")
-    except Exception as e:
-        vector_status = f"error: {e}"
+    except Exception:
+        logger.warning("readiness_vector_store_probe_failed", exc_info=True)
+        vector_status = "error"
 
     bedrock_status = "ok"
     try:
@@ -228,8 +238,9 @@ def readiness():
         vec = client.embed_text("health check")
         if not vec or len(vec) != app.state.config["bedrock_embed_dimensions"]:
             bedrock_status = "unexpected_response"
-    except Exception as e:
-        bedrock_status = f"error: {e}"
+    except Exception:
+        logger.warning("readiness_bedrock_probe_failed", exc_info=True)
+        bedrock_status = "error"
 
     description_llm_status = "ok"
     try:
@@ -241,8 +252,9 @@ def readiness():
         out = llm_client.generate(prompt="ping", max_tokens=4)
         if not out:
             description_llm_status = "unexpected_response"
-    except Exception as e:
-        description_llm_status = f"error: {e}"
+    except Exception:
+        logger.warning("readiness_description_llm_probe_failed", exc_info=True)
+        description_llm_status = "error"
 
     overall = (
         "ok"

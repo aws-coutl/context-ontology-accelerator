@@ -133,6 +133,67 @@ class TestCreateGrant:
         assert grant["allowedMetrics"] == ["revenue"]
 
     @patch("coa_control_plane.grants.create_handler.DynamoDBDAO")
+    def test_declared_empty_overrides_are_persisted(self, mock_dao_cls):
+        """SEMANTICS CHANGE (was: empty lists silently dropped at write time).
+
+        An explicitly empty tableAllowlist means "no tables permitted" — a
+        deny-all restriction the SQL firewall enforces. Dropping it created a
+        grant MORE permissive than requested with a 201 and no warning. Absence
+        of the field (the web console's blank input) still means unrestricted.
+        """
+        mock_roles_dao = MagicMock()
+        mock_mappings_dao = MagicMock()
+        mock_dao_cls.side_effect = [mock_roles_dao, mock_mappings_dao]
+        mock_roles_dao.get.return_value = {"PK": f"NS#{VALID_NS_ID}", "SK": "ROLE#analyst"}
+
+        resp = handler(
+            _event(
+                body={
+                    "principalType": "User",
+                    "principalId": "alice@company.com",
+                    "role": "analyst",
+                    "tableAllowlist": [],
+                    "allowedMetrics": [],
+                }
+            ),
+            None,
+        )
+        assert resp["statusCode"] == 201
+
+        item = mock_mappings_dao.put.call_args[0][0]
+        assert item["tableAllowlist"] == []
+        assert item["allowedMetrics"] == []
+        assert "columnDenylist" not in item  # omitted field stays omitted
+
+        grant = json.loads(resp["body"])["grant"]
+        assert grant["tableAllowlist"] == []
+        assert grant["allowedMetrics"] == []
+
+    @patch("coa_control_plane.grants.create_handler.DynamoDBDAO")
+    def test_omitted_overrides_are_not_persisted(self, mock_dao_cls):
+        """The counterpart: absence really does mean unrestricted (None)."""
+        mock_roles_dao = MagicMock()
+        mock_mappings_dao = MagicMock()
+        mock_dao_cls.side_effect = [mock_roles_dao, mock_mappings_dao]
+        mock_roles_dao.get.return_value = {"PK": f"NS#{VALID_NS_ID}", "SK": "ROLE#analyst"}
+
+        resp = handler(
+            _event(
+                body={
+                    "principalType": "User",
+                    "principalId": "alice@company.com",
+                    "role": "analyst",
+                }
+            ),
+            None,
+        )
+        assert resp["statusCode"] == 201
+
+        item = mock_mappings_dao.put.call_args[0][0]
+        for opt in ("tableAllowlist", "columnDenylist", "allowedMetrics"):
+            assert opt not in item
+
+    @patch("coa_control_plane.grants.create_handler.DynamoDBDAO")
     def test_duplicate_grant_returns_409(self, mock_dao_cls):
         mock_roles_dao = MagicMock()
         mock_mappings_dao = MagicMock()

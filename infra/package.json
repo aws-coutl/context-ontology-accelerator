@@ -9,7 +9,7 @@
     "lint": "tsc --noEmit && uv run ruff check lambda lib/lambdas test && uv run ruff format --check lambda lib/lambdas test",
     "format": "prettier --write \"bin/**/*.ts\" \"lib/**/*.ts\"",
     "format:check": "prettier --check \"bin/**/*.ts\" \"lib/**/*.ts\"",
-    "test": "jest --runInBand",
+    "test": "jest --runInBand && uv run pytest test/lambdas -q",
     "cdk": "cdk"
   },
   "devDependencies": {

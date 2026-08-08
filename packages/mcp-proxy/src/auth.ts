@@ -122,9 +122,65 @@ export async function refreshToken(
   return null;
 }
 
+/**
+ * True when `raw` is a well-formed absolute http(s) URL safe to pass to the OS
+ * browser opener.
+ *
+ * Rejects any other scheme — `file:`, `javascript:`, and the `cmd:`-style
+ * schemes Windows shell handlers may act on — plus quote and newline
+ * characters, which are the building blocks of argument-splitting attacks
+ * against command-line parsers. Percent-encoding is allowed: the query string
+ * legitimately contains `%` (e.g. the encoded `redirect_uri`).
+ */
+export function isSafeBrowserUrl(raw: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+  return !/["'\r\n]/.test(raw);
+}
+
+/**
+ * The `[command, argv]` pair used to hand `url` to the platform browser.
+ *
+ * Every platform passes the URL as its own argv entry so that no shell or
+ * script parser ever sees it:
+ *
+ * - macOS `open` / Linux `xdg-open` — plain execs, no shell involved.
+ * - Windows `rundll32 url.dll,FileProtocolHandler <url>` — the documented
+ *   shell-free way to open a URL in the default browser.
+ *
+ * Windows deliberately avoids the two obvious alternatives. `cmd /c start ""`
+ * re-parses its arguments, which reintroduces command injection even under
+ * `spawn`. `powershell -Command Start-Process -FilePath` is worse than it
+ * looks: Node has no `execve` on Windows, so `spawn` flattens argv into one
+ * command-line string and only quotes arguments containing a space, tab, or
+ * double-quote. An OAuth URL contains none of those but always contains several
+ * `&` characters, which reach PowerShell unquoted — `&` is PowerShell's
+ * reserved call operator, so the command fails to parse every time.
+ *
+ * Exported for tests: this is the security-relevant part of the browser-open
+ * path, and asserting the URL occupies its own argv slot is what proves it is
+ * never re-tokenized.
+ */
+export function browserOpenCommand(platform: string, url: string): [string, string[]] {
+  if (platform === "darwin") return ["open", [url]];
+  if (platform === "win32") return ["rundll32.exe", ["url.dll,FileProtocolHandler", url]];
+  return ["xdg-open", [url]];
+}
+
 /* v8 ignore start -- interactive browser + local-callback-server OAuth flow;
    exercised by integration/manual login, not unit-testable without a real
    browser and loopback HTTP server. The pure token helpers above are covered. */
+
+/** Open `url` in the platform browser without going through a shell. */
+function openInBrowser(url: string): void {
+  const [command, args] = browserOpenCommand(process.platform, url);
+  spawn(command, args, { detached: true, stdio: "ignore" }).unref();
+}
 async function pkceFlow(clientId: string, issuerUrl: string): Promise<string> {
   const verifier = randomBytes(64).toString("base64url").slice(0, 128);
   const challenge = createHash("sha256").update(verifier).digest("base64url");
@@ -183,12 +239,14 @@ async function pkceFlow(clientId: string, issuerUrl: string): Promise<string> {
       process.stderr.write("Opening browser for login...\n");
       process.stderr.write(`If browser doesn't open, visit: ${loginUrl}\n`);
 
-      // Use spawn (not exec) to avoid shell injection via loginUrl
-      const opener =
-        process.platform === "darwin" ? "open" :
-        process.platform === "win32" ? "cmd" : "xdg-open";
-      const args = process.platform === "win32" ? ["/c", "start", '""', loginUrl] : [loginUrl];
-      spawn(opener, args, { detached: true, stdio: "ignore" }).unref();
+      // Only hand the URL to the OS opener once it is a validated http(s) URL.
+      // `authorization_endpoint` comes from the remote OIDC discovery document,
+      // so it is untrusted input on this command line.
+      if (isSafeBrowserUrl(loginUrl)) {
+        openInBrowser(loginUrl);
+      } else {
+        process.stderr.write("Refusing to open a non-http(s) authorization URL.\n");
+      }
     });
 
     setTimeout(() => {

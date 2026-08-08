@@ -1,29 +1,30 @@
-# Contributing to Context Ontology Accelerator 
+# Contributing to Context Ontology Accelerator
 
-Thank you for your interest in contributing!
+Thank you for your interest in Context Ontology Accelerator!
 
-## How to Add a New Package
+## Reporting Bugs/Feature Requests
 
-1. Create a new directory under `packages/` with the standard layout:
-   - `pyproject.toml` with the package metadata
-   - `src/<python_package_name>/__init__.py`
-   - `tests/unit/` and `tests/integ/` directories
-2. Add the package path to the root `pyproject.toml` workspace members.
-3. Run `uv sync` to update the workspace lockfile.
-4. Add a corresponding CDK stack under `infra/lib/stacks/services/` (TypeScript, kebab-case filename).
+At this time, we are not accepting pull requests for this repository and it is instead maintained by an AWS development team.
 
-## Coding Standards
+However, we welcome you to use the GitHub issue tracker to report bugs or suggest features.
 
-- **Python**: Follow [ruff](https://docs.astral.sh/ruff/) linting rules defined in `ruff.toml`.
-- **Line length**: 120 characters max.
-- **Type hints**: Required for all public functions.
-- **Logging**: Use `structlog` via `libs/common` — no raw `print()` in library code.
-- **API contracts**: All service APIs are defined in Smithy models under `models/`. Do not hand-write OpenAPI specs.
+- **Bug reports:** Open a [GitHub issue](https://github.com/aws/context-ontology-accelerator/issues) describing what you expected, what happened, and how to reproduce it.
+- **Feature requests and feedback:** Open a [GitHub issue](https://github.com/aws/context-ontology-accelerator/issues) describing your use case.
 
-## PR Process
+We read every issue and use them to shape the roadmap. We may accept pull requests in the future.
 
-1. Create a feature branch from `main`.
-2. Ensure all checks pass: `make lint && make test`.
-3. Update `CHANGELOG.md` under the `[Unreleased]` section.
-4. Request review from at least one team member.
-5. Squash-merge to `main`.
+## Code of Conduct
+
+This project has adopted the [Amazon Open Source Code of Conduct](CODE_OF_CONDUCT.md).
+
+## Security issue notifications
+
+Do not report security issues through GitHub Issues. Follow the process in [SECURITY.md](SECURITY.md).
+
+## Licensing
+
+See the [LICENSE](LICENSE) file for our project's licensing. We will ask you to confirm the licensing of your contribution.
+
+## Amazon employees
+
+If you are an Amazon employee, contribute through the internal project following the contribution guidance at group level. See [DEVELOPMENT.md](DEVELOPMENT.md) for the monorepo build and development workflow.

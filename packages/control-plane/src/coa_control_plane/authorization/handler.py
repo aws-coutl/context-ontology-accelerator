@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 from typing import Any
+from urllib.parse import urlparse
 
 import structlog
 from coa_authorization.policy_evaluator import evaluate
@@ -68,6 +69,30 @@ _ARCHIVED_STATUS = "ARCHIVED"
 _token_authorizer: TokenAuthorizer | None = None
 
 
+def _is_cognito_issuer(issuer: str) -> bool:
+    """True when *issuer* is an Amazon Cognito user-pool issuer URL.
+
+    Parses the URL and matches on the host label rather than searching the raw
+    string. A substring test such as ``"cognito-idp" in issuer`` would also
+    match an attacker-controlled host that merely embeds the token — e.g.
+    ``https://cognito-idp.amazonaws.com.evil.test/pool`` or a URL carrying it
+    in the path or query — and would pick the Cognito authorizer for a
+    non-Cognito identity provider.
+    """
+    parsed = urlparse(issuer)
+    if parsed.scheme != "https":
+        return False
+    host = (parsed.hostname or "").lower()
+    # Canonical form: cognito-idp.<region>.amazonaws.com (or .amazonaws.com.cn
+    # in the China partition).
+    labels = host.split(".")
+    return (
+        len(labels) >= 4
+        and labels[0] == "cognito-idp"
+        and (host.endswith(".amazonaws.com") or host.endswith(".amazonaws.com.cn"))
+    )
+
+
 def _get_token_authorizer() -> TokenAuthorizer:
     global _token_authorizer  # noqa: PLW0603
     if _token_authorizer is not None:
@@ -78,7 +103,7 @@ def _get_token_authorizer() -> TokenAuthorizer:
     client_id = os.environ.get("CLIENT_ID")
     region = os.environ["AWS_REGION"]
 
-    if "cognito-idp" in issuer and ".amazonaws.com/" in issuer:
+    if _is_cognito_issuer(issuer):
         user_pool_id = issuer.rstrip("/").rsplit("/", maxsplit=1)[-1]
         _token_authorizer = CognitoTokenAuthorizer(
             user_pool_id=user_pool_id,
@@ -267,7 +292,13 @@ def _resolve_roles(
 
     for pk in principal_keys:
         try:
-            result = dao.query(
+            # query_all, not query: a single query returns one 1 MB page, so a
+            # principal whose grants span more than that would have the roles on
+            # later pages silently dropped — yielding a 403 on a namespace the
+            # user holds a valid grant for. Page boundaries depend on internal
+            # item ordering, so which roles vanish can change between
+            # invocations, making it look intermittent and unreproducible.
+            items = dao.query_all(
                 QueryParams(
                     key_condition="#pk = :pk",
                     expression_values={":pk": pk},
@@ -278,7 +309,7 @@ def _resolve_roles(
         except Exception:
             logger.exception("Failed to query roles", principal_key=pk)
             raise
-        for item in result.items:
+        for item in items:
             role = item.get("role", "")
             resource_id = item.get("resourceId", "")
             if resource_id == "GLOBAL" and role:

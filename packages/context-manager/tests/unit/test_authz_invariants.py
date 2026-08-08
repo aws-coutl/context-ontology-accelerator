@@ -1,0 +1,229 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""End-to-end security invariants: grant rows → resolved profile → firewall decision.
+
+The per-unit suites (``test_role_resolver.py``, ``test_sql_firewall.py``) each cover
+their own half. These tests exist because the halves can agree individually and
+still compose into a bypass: the resolver can emit a restriction the firewall then
+declines to enforce.
+
+That is not hypothetical — it is how the empty-``tableAllowlist`` fail-open was
+found. ``test_explicitly_empty_allowlist_denies_all_tables`` asserted the resolver
+produced ``[]`` and passed, while the firewall treated the empty list as falsy,
+dropped the restriction, and allowed every table. A profile-level assertion cannot
+catch that; only running the query through can.
+
+Each test therefore asserts on the DECISION (denied / allowed), never on an
+intermediate field.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+from coa_serve import role_resolver
+from coa_serve.tier2.sql_firewall import SQLFirewall
+
+_NS = "ns-Z"
+_USER = "bob@x.com"
+
+# A role Cedar permits for `query` on the namespace, so these tests exercise the
+# DATA layer rather than tripping the action layer first.
+_CEDAR_OK_ROLE = "namespace-owner"
+
+
+def _decide(grants: list[dict], sql: str, *, namespace: str = _NS) -> tuple[bool, str | None]:
+    """Resolve a profile from ``grants``, then run ``sql`` through the firewall.
+
+    Returns ``(denied, reason)`` — the observable outcome a caller would see.
+    """
+    dao = MagicMock()
+    dao.query_all.side_effect = lambda params: grants
+    with (
+        patch.object(role_resolver, "_RRM_TABLE", "rrm"),
+        patch.object(role_resolver, "DynamoDBDAO", return_value=dao),
+    ):
+        resolved = role_resolver.resolve_profile(_USER, [], namespace=namespace)
+
+    profile: dict = {}
+    resolved.inject_into(profile)
+    result = SQLFirewall().evaluate(sql, profile=profile, namespace=namespace)
+    return result.denied, result.reason
+
+
+def _grant(role: str = _CEDAR_OK_ROLE, **fields) -> dict:
+    return {"role": role, "resourceId": _NS, **fields}
+
+
+_PLATFORM_ADMIN = {"role": "platform-admin", "resourceId": "GLOBAL"}
+_PLATFORM_VIEWER = {"role": "platform-viewer", "resourceId": "GLOBAL"}
+
+
+@pytest.mark.unit
+class TestColumnDenylistIsEnforced:
+    """A denied column must be unreadable, whatever else the principal holds."""
+
+    DENY_SSN = {"columnDenylist": {"customers": ["ssn"]}}
+
+    def test_denied_column_is_blocked(self):
+        denied, reason = _decide([_grant(**self.DENY_SSN)], "SELECT ssn FROM customers")
+
+        assert denied, "a denylisted column must not be readable"
+        assert "ssn" in (reason or "")
+
+    def test_permitted_column_still_readable(self):
+        """The denylist must not become a blanket deny."""
+        denied, _ = _decide([_grant(**self.DENY_SSN)], "SELECT name FROM customers")
+
+        assert not denied
+
+    def test_platform_admin_cannot_read_a_denied_column(self):
+        denied, _ = _decide([_grant(**self.DENY_SSN), _PLATFORM_ADMIN], "SELECT ssn FROM customers")
+
+        assert denied, "platform-admin must not bypass the data layer"
+
+    def test_platform_viewer_cannot_read_a_denied_column(self):
+        """platform-viewer is the role the docs recommend for auditors.
+
+        It is read-only and cannot grant itself anything, so its restrictions are a
+        real boundary — an auditor should see structure without raw PII.
+        """
+        denied, _ = _decide([_grant(**self.DENY_SSN), _PLATFORM_VIEWER], "SELECT ssn FROM customers")
+
+        assert denied, "platform-viewer must not bypass the data layer"
+
+    def test_an_unrestricted_grant_on_the_same_namespace_cannot_lift_it(self):
+        """The sharpest edge of the old permissive merge, asserted on behaviour."""
+        denied, _ = _decide(
+            [_grant(role="data-analyst", **self.DENY_SSN), _grant(role="namespace-owner")],
+            "SELECT ssn FROM customers",
+        )
+
+        assert denied, "a second unrestricted grant must not erase the denylist"
+
+    def test_denylists_from_separate_grants_both_apply(self):
+        grants = [
+            _grant(role="data-analyst", columnDenylist={"customers": ["ssn"]}),
+            _grant(role="reviewer", columnDenylist={"customers": ["dob"]}),
+        ]
+
+        assert _decide(grants, "SELECT ssn FROM customers")[0]
+        assert _decide(grants, "SELECT dob FROM customers")[0]
+        assert not _decide(grants, "SELECT name FROM customers")[0]
+
+    def test_case_variation_does_not_bypass(self):
+        denied, _ = _decide([_grant(**self.DENY_SSN)], "SELECT SSN FROM CUSTOMERS")
+
+        assert denied, "SQL identifiers are case-insensitive; the denylist must be too"
+
+    def test_restrictions_do_not_leak_into_another_namespace(self):
+        """Restrictions are namespace-scoped — they must not over-apply either.
+
+        Needs a grant on the other namespace too: without one, Cedar denies at the
+        ACTION layer first and the data layer is never reached, so the test would
+        pass for the wrong reason.
+        """
+        grants = [
+            _grant(role="data-analyst", **self.DENY_SSN),  # ns-Z: ssn denied
+            {"role": _CEDAR_OK_ROLE, "resourceId": "ns-OTHER"},  # ns-OTHER: unrestricted
+        ]
+
+        denied, _ = _decide(grants, "SELECT ssn FROM customers", namespace="ns-OTHER")
+
+        assert not denied, "a denylist on ns-Z must not restrict ns-OTHER"
+
+
+@pytest.mark.unit
+class TestTableAllowlistIsEnforced:
+    def test_unlisted_table_is_blocked(self):
+        denied, reason = _decide([_grant(tableAllowlist=["customers"])], "SELECT * FROM orders")
+
+        assert denied
+        assert "orders" in (reason or "")
+
+    def test_listed_table_is_allowed(self):
+        denied, _ = _decide([_grant(tableAllowlist=["customers"])], "SELECT * FROM customers")
+
+        assert not denied
+
+    def test_platform_admin_cannot_reach_an_unlisted_table(self):
+        denied, _ = _decide([_grant(tableAllowlist=["customers"]), _PLATFORM_ADMIN], "SELECT * FROM orders")
+
+        assert denied
+
+    def test_an_unrestricted_grant_cannot_widen_the_allowlist(self):
+        denied, _ = _decide(
+            [_grant(role="data-analyst", tableAllowlist=["customers"]), _grant(role="namespace-owner")],
+            "SELECT * FROM orders",
+        )
+
+        assert denied, "absence of an allowlist must add no constraint, not remove one"
+
+    def test_allowlists_from_separate_grants_both_apply(self):
+        grants = [
+            _grant(role="data-analyst", tableAllowlist=["customers"]),
+            _grant(role="reviewer", tableAllowlist=["orders"]),
+        ]
+
+        assert not _decide(grants, "SELECT * FROM customers")[0]
+        assert not _decide(grants, "SELECT * FROM orders")[0]
+        assert _decide(grants, "SELECT * FROM payments")[0]
+
+    def test_explicitly_empty_allowlist_denies_every_table(self):
+        """Regression: an empty list is a restriction, not the absence of one.
+
+        The resolver emits ``[]`` when a grant explicitly declares an empty
+        allowlist. The firewall previously treated it as falsy and allowed
+        everything, so "no tables permitted" silently became "all tables
+        permitted". Asserted on the decision because the profile-level assertion
+        passed throughout.
+        """
+        denied, _ = _decide([_grant(tableAllowlist=[])], "SELECT * FROM customers")
+
+        assert denied, "an explicitly empty allowlist must deny every table"
+
+    def test_no_allowlist_anywhere_leaves_tables_unrestricted(self):
+        """The counterpart: absence really does mean unrestricted."""
+        denied, _ = _decide([_grant()], "SELECT * FROM anything")
+
+        assert not denied
+
+
+@pytest.mark.unit
+class TestFailClosed:
+    """A failed grant read must never widen access."""
+
+    def test_grant_lookup_failure_propagates(self):
+        """Restrictions computed from a partial read are more permissive than truth."""
+        dao = MagicMock()
+        dao.query_all.side_effect = RuntimeError("dynamodb throttled")
+        with (
+            patch.object(role_resolver, "_RRM_TABLE", "rrm"),
+            patch.object(role_resolver, "DynamoDBDAO", return_value=dao),
+            pytest.raises(RuntimeError),
+        ):
+            role_resolver.resolve_profile(_USER, [], namespace=_NS)
+
+    def test_every_grant_page_is_read(self):
+        """Grants past the first 1 MB page must not be dropped.
+
+        A restricted grant on a later page while an unrestricted one survives would
+        otherwise make the merge see no restrictions at all.
+        """
+        dao = MagicMock()
+        dao.query_all.side_effect = lambda params: [
+            _grant(role="namespace-owner"),
+            _grant(role="data-analyst", columnDenylist={"customers": ["ssn"]}),
+        ]
+        with (
+            patch.object(role_resolver, "_RRM_TABLE", "rrm"),
+            patch.object(role_resolver, "DynamoDBDAO", return_value=dao),
+        ):
+            resolved = role_resolver.resolve_profile(_USER, [], namespace=_NS)
+
+        # query_all (not query) is what guarantees this; assert the DAO contract too.
+        assert dao.query_all.called
+        assert not dao.query.called, "authorization reads must not use the single-page query()"
+        assert resolved.column_denylist == {"customers": ["ssn"]}

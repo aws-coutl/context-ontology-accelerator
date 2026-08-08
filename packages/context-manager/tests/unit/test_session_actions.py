@@ -18,6 +18,8 @@ from coa_serve.models import (
     TraceStep,
 )
 
+pytestmark = pytest.mark.unit
+
 HAS_AGENTCORE = importlib.util.find_spec("bedrock_agentcore") is not None
 agentcore_required = pytest.mark.skipif(not HAS_AGENTCORE, reason="bedrock_agentcore SDK not installed")
 

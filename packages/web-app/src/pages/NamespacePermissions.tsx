@@ -80,7 +80,11 @@ function renderBadgeList(
   color: BadgeProps["color"],
   emptyLabel: string,
 ): React.ReactNode {
-  if (!values?.length) return unrestrictedLabel(emptyLabel);
+  // Absent = unrestricted. An explicitly EMPTY list is a deny-all restriction
+  // (enforced by the SQL firewall) and must not render as the unrestricted
+  // label — "All" for a grant that permits nothing would be actively wrong.
+  if (!values) return unrestrictedLabel(emptyLabel);
+  if (!values.length) return <Badge color="red">None</Badge>;
   return (
     <SpaceBetween direction="horizontal" size="xxs">
       {values.map((v) => (

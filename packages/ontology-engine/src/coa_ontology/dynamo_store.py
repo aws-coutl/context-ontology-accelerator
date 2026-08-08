@@ -1326,21 +1326,6 @@ def get_namespace_meta(namespace: str) -> dict | None:
     return resp.get("Item")
 
 
-def list_namespaces(limit: int = 100) -> list[dict]:
-    """Return every namespace META row.
-
-    Uses a Scan with filter on ``SK = "META"`` and ``begins_with(PK, "NAMESPACE#")``.
-    For small deployments (dozens of namespaces) this is fine; add a GSI
-    later if the namespace count grows past a few hundred.
-    """
-    resp = _get_table().scan(
-        FilterExpression="begins_with(PK, :p) AND SK = :sk",
-        ExpressionAttributeValues={":p": "NAMESPACE#", ":sk": "META"},
-        Limit=limit,
-    )
-    return resp.get("Items", [])
-
-
 def put_ontology_registry(namespace: str, ontology_id: str, data: dict) -> dict:
     """Create or replace the ONTOLOGY#{id} registry row.
 

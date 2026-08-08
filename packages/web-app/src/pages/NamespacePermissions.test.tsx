@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import React from "react";
-import { render, screen, act, waitFor } from "@testing-library/react";
+import { render, screen, act, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, it, expect, vi, beforeEach } from "vitest";
@@ -72,6 +72,19 @@ vi.mock("../api-hooks/use-list-namespace-grants", () => ({
               role: "namespace-owner",
               grantedBy: "admin@example.com",
               grantedAt: "2026-01-02T00:00:00Z",
+            },
+            {
+              // Deny-all grant: a DECLARED-empty allowlist means "no tables
+              // permitted" (enforced by the SQL firewall) — distinct from
+              // bob's absent fields, which mean unrestricted.
+              grantId: "g3",
+              namespaceId: "ns-1",
+              principalType: "User",
+              principalId: "carol@example.com",
+              role: "data-analyst",
+              grantedBy: "admin@example.com",
+              grantedAt: "2026-01-03T00:00:00Z",
+              tableAllowlist: [],
             },
           ],
         },
@@ -164,7 +177,24 @@ describe("NamespacePermissions", () => {
     expect(screen.getByText("ssn")).toBeInTheDocument(); // denied column
     // bob's unrestricted grant → muted "All" (tables + metrics) and "None".
     expect(screen.getAllByText("All").length).toBeGreaterThanOrEqual(2);
-    expect(screen.getByText("None")).toBeInTheDocument();
+    expect(screen.getAllByText("None").length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("renders a declared-empty allowlist as a deny-all 'None' badge, not 'All'", async () => {
+    render(<NamespacePermissions />, { wrapper });
+    await act(async () => {
+      screen.getByRole("tab", { name: /Members/i }).click();
+    });
+    // carol's grant declares tableAllowlist: [] — a deny-all restriction the
+    // SQL firewall enforces. Rendering the unrestricted "All" label for it
+    // would tell a reviewer the exact opposite of what the grant does.
+    const carolRow = screen.getByText("carol@example.com").closest("tr");
+    expect(carolRow).not.toBeNull();
+    const row = within(carolRow as HTMLElement);
+    // Allowed-tables cell shows the deny-all badge…
+    expect(row.getAllByText("None").length).toBeGreaterThanOrEqual(1);
+    // …while the absent allowedMetrics still shows unrestricted "All".
+    expect(row.getByText("All")).toBeInTheDocument();
   });
 
   it("revokes every selected member and clears the selection after success", async () => {
@@ -200,10 +230,10 @@ describe("NamespacePermissions", () => {
       modalRevoke().click();
     });
 
-    // Both grants are revoked via mutateAsync (the single-observer bug would
-    // have left one promise unresolved).
+    // All three grants are revoked via mutateAsync (the single-observer bug
+    // would have left promises unresolved).
     await waitFor(() => {
-      expect(deleteGrantMock.mutateAsync).toHaveBeenCalledTimes(2);
+      expect(deleteGrantMock.mutateAsync).toHaveBeenCalledTimes(3);
     });
     // The .then ran: selection cleared (so the action is disabled again),
     // which is the same state update that closes the modal.

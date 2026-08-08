@@ -149,7 +149,11 @@ def _to_grant_summary(item: dict[str, Any], namespace_id: str) -> dict[str, Any]
         "grantedBy": item.get("grantedBy", ""),
         "grantedAt": item.get("grantedAt", ""),
     }
+    # ``is not None``, not truthiness: a declared-empty override (e.g.
+    # tableAllowlist: []) is a deny-all restriction and must stay visible to
+    # reviewers — omitting it makes a deny-all grant indistinguishable from an
+    # unrestricted one in every listing.
     for opt in ("tableAllowlist", "columnDenylist", "allowedMetrics"):
-        if item.get(opt):
+        if item.get(opt) is not None:
             summary[opt] = item[opt]
     return summary

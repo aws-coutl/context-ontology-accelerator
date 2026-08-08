@@ -66,9 +66,11 @@ class TestResolveGrant:
         profile = await resolve_grant(caller, "sales")
         d = profile.to_profile_dict()
         assert "namespace" in d
-        assert "tableAllowlist" in d
-        assert "columnDenylist" in d
         assert d["namespace"] == "sales"
+        # Unrestricted (None) restriction fields are OMITTED, not sent as empty
+        # lists — an empty tableAllowlist now means deny-all to the SQL firewall.
+        assert "tableAllowlist" not in d
+        assert "columnDenylist" not in d
 
     @pytest.mark.asyncio
     @patch("coa_serve.role_resolver.resolve_profile")
@@ -96,8 +98,14 @@ class TestResolveGrant:
 
     @pytest.mark.asyncio
     @patch("coa_serve.role_resolver.resolve_profile")
-    async def test_data_source_ids_empty_when_no_allowed_metrics(self, mock_resolve):
-        """When allowed_metrics is None or empty, data_source_ids should be empty list."""
+    async def test_unrestricted_stays_none_not_empty(self, mock_resolve):
+        """SEMANTICS CHANGE (was: None collapsed to []).
+
+        None means unrestricted; [] is a deny-all restriction under the SQL
+        firewall's empty-vs-absent semantics. Collapsing None to [] would tell a
+        downstream enforcer that an unrestricted principal may use NO metrics —
+        the two must stay distinct.
+        """
         from coa_serve.role_resolver import ResolvedProfile as ServeProfile
 
         mock_resolve.return_value = ServeProfile(
@@ -113,8 +121,32 @@ class TestResolveGrant:
         caller = _make_caller(user_id="alice", namespaces=["sales"])
         profile = await resolve_grant(caller, "sales")
 
-        # data_source_ids should be empty when allowed_metrics is None
-        assert profile.data_source_ids == []
+        assert profile.data_source_ids is None
+        # And the unset field is omitted from the forwarded profile entirely.
+        assert "dataSourceIds" not in profile.to_profile_dict()
+
+    @pytest.mark.asyncio
+    @patch("coa_serve.role_resolver.resolve_profile")
+    async def test_declared_empty_restriction_is_forwarded(self, mock_resolve):
+        """A declared-empty (deny-all) restriction survives the profile round-trip."""
+        from coa_serve.role_resolver import ResolvedProfile as ServeProfile
+
+        mock_resolve.return_value = ServeProfile(
+            user_id="alice",
+            groups=["viewer"],
+            global_roles=[],
+            resource_roles=[{"role": "data-analyst", "resourceUID": "sales"}],
+            table_allowlist=[],  # deny-all
+            column_denylist=None,
+            allowed_metrics=None,
+        )
+
+        caller = _make_caller(user_id="alice", namespaces=["sales"])
+        profile = await resolve_grant(caller, "sales")
+
+        d = profile.to_profile_dict()
+        assert d["tableAllowlist"] == []
+        assert "columnDenylist" not in d
 
 
 @pytest.mark.unit
@@ -149,8 +181,11 @@ class TestResolvedProfile:
         assert d["userId"] == ""
         assert d["globalRoles"] == []
         assert d["resourceRoles"] == []
-        assert d["tableAllowlist"] == []
-        assert d["columnDenylist"] == {}
+        # Default = unrestricted (None) — restriction keys are omitted rather
+        # than fabricated as empty (empty now means deny-all to the firewall).
+        assert "tableAllowlist" not in d
+        assert "columnDenylist" not in d
+        assert "dataSourceIds" not in d
 
 
 @pytest.mark.unit
@@ -236,29 +271,46 @@ class TestCedarEvaluation:
 class TestRoleResolutionFailure:
     """Behavior when the shared role_resolver raises."""
 
+    # An admin caller used to get platform-admin + namespace-owner here, returned
+    # EARLY — before the Cedar evaluation — off nothing but an "admin" entry in
+    # their IdP groups. A failed grant read means we do not know what the caller
+    # may do, which is never a reason to assume the most privileged answer. The
+    # path also became reachable once resolve_profile stopped swallowing its query
+    # errors, so a DynamoDB throttle would have escalated any admin-group caller.
+
     @pytest.mark.asyncio
     @patch("coa_serve.role_resolver.resolve_profile")
-    async def test_admin_role_falls_back_to_owner_profile(self, mock_resolve):
-        """When role resolution fails but caller is admin, allow with owner profile."""
+    async def test_admin_role_resolution_failure_raises(self, mock_resolve):
+        """Admins fail closed too — no privilege escalation on a backend error."""
         mock_resolve.side_effect = RuntimeError("RRM table unavailable")
         caller = _make_caller(user_id="root", namespaces=["sales"], roles=["Admin"])
 
-        profile = await resolve_grant(caller, "sales")
-
-        assert profile.namespace == "sales"
-        assert profile.user_id == "root"
-        assert profile.global_roles == ["platform-admin"]
-        assert profile.resource_roles == [{"role": "namespace-owner", "resourceUID": "sales"}]
+        with pytest.raises(GrantResolutionError, match="Failed to resolve grant"):
+            await resolve_grant(caller, "sales")
 
     @pytest.mark.asyncio
     @patch("coa_serve.role_resolver.resolve_profile")
-    async def test_lowercase_admin_role_falls_back(self, mock_resolve):
+    async def test_lowercase_admin_role_also_fails_closed(self, mock_resolve):
         mock_resolve.side_effect = RuntimeError("boom")
         caller = _make_caller(user_id="root", namespaces=["sales"], roles=["admin"])
 
-        profile = await resolve_grant(caller, "sales")
+        with pytest.raises(GrantResolutionError, match="Failed to resolve grant"):
+            await resolve_grant(caller, "sales")
 
-        assert profile.global_roles == ["platform-admin"]
+    @pytest.mark.asyncio
+    @patch("coa_serve.role_resolver.resolve_profile")
+    async def test_failure_never_returns_a_profile_that_skips_cedar(self, mock_resolve):
+        """The escalation was worse than its roles: it returned before Cedar ran."""
+        mock_resolve.side_effect = RuntimeError("throttled")
+        caller = _make_caller(user_id="root", namespaces=["sales"], roles=["Admin"])
+
+        with (
+            patch("coa_mcp.auth.grant_resolver._evaluate_cedar") as mock_cedar,
+            pytest.raises(GrantResolutionError),
+        ):
+            await resolve_grant(caller, "sales")
+
+        mock_cedar.assert_not_called()
 
     @pytest.mark.asyncio
     @patch("coa_serve.role_resolver.resolve_profile")

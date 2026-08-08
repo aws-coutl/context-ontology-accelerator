@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from unittest.mock import MagicMock
 
 import pytest
@@ -456,6 +458,209 @@ class TestBedrockConverseStream:
         with pytest.raises(ClientError):
             await client.converse("test")
         assert mock_client.converse.call_count == 1
+
+
+@pytest.mark.unit
+class TestConverseMultipleTextBlocks:
+    """The Converse API may split a response across several content blocks."""
+
+    async def test_all_text_blocks_are_joined(self):
+        from coa_serve.clients.bedrock import BedrockLLMClient
+
+        mock_client = MagicMock()
+        mock_client.converse.return_value = {
+            "output": {
+                "message": {
+                    "content": [
+                        {"text": "SELECT ?claim WHERE {"},
+                        {"text": " ?claim a :Claim }"},
+                    ]
+                }
+            }
+        }
+        client = BedrockLLMClient(model_id="test-model", region="us-east-1")
+        client._client = mock_client
+
+        result = await client.converse("q")
+
+        assert result.text == "SELECT ?claim WHERE { ?claim a :Claim }", (
+            "blocks after the first were dropped, truncating the generation"
+        )
+
+    async def test_non_text_blocks_are_still_skipped(self):
+        from coa_serve.clients.bedrock import BedrockLLMClient
+
+        mock_client = MagicMock()
+        mock_client.converse.return_value = {
+            "output": {
+                "message": {
+                    "content": [
+                        {"text": "a"},
+                        {"toolUse": {"name": "x"}},
+                        {"text": "b"},
+                    ]
+                }
+            }
+        }
+        client = BedrockLLMClient(model_id="test-model", region="us-east-1")
+        client._client = mock_client
+
+        assert (await client.converse("q")).text == "ab"
+
+
+@pytest.mark.unit
+class TestConverseStreamCleanup:
+    """Generator finalization must not block on the uncancellable worker thread.
+
+    The worker iterates boto3's synchronous EventStream in a thread-pool thread, so
+    there is no cancellation point: `await task` in `finally` waited out
+    BEDROCK_READ_TIMEOUT, defeating the idle-timeout guard, and on early close it
+    suspended inside GeneratorExit handling — which CPython rejects for async
+    generators ("async generator ignored GeneratorExit").
+    """
+
+    class _BlockingStream:
+        """Emits one chunk, then blocks like boto3's EventStream until closed."""
+
+        def __init__(self, ticks: int = 200, tick_s: float = 0.05):
+            self.closed = False
+            self._ticks = ticks
+            self._tick_s = tick_s
+
+        def __iter__(self):
+            import time
+
+            yield {"contentBlockDelta": {"delta": {"text": "hello"}}}
+            for _ in range(self._ticks):
+                if self.closed:
+                    raise RuntimeError("stream closed")
+                time.sleep(self._tick_s)
+
+        def close(self):
+            self.closed = True
+
+    def _client_over(self, stream):
+        from coa_serve.clients.bedrock import BedrockLLMClient
+
+        mock_client = MagicMock()
+        mock_client.converse_stream.return_value = {"stream": stream}
+        client = BedrockLLMClient(model_id="test-model", region="us-east-1")
+        client._client = mock_client
+        return client
+
+    async def test_early_close_returns_promptly(self):
+        import time
+
+        stream = self._BlockingStream()
+        agen = self._client_over(stream).converse_stream("q")
+
+        assert await agen.__anext__() == "hello"
+        started = time.monotonic()
+        await agen.aclose()
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 2.0, f"aclose() blocked for {elapsed:.1f}s waiting on the worker thread"
+
+    async def test_early_close_closes_the_upstream_stream(self):
+        """Otherwise the worker keeps consuming Bedrock (and billing) after disconnect."""
+        stream = self._BlockingStream()
+        agen = self._client_over(stream).converse_stream("q")
+
+        await agen.__anext__()
+        await agen.aclose()
+
+        assert stream.closed
+
+    async def test_early_close_does_not_raise(self):
+        stream = self._BlockingStream()
+        agen = self._client_over(stream).converse_stream("q")
+
+        await agen.__anext__()
+        await agen.aclose()  # must not raise "async generator ignored GeneratorExit"
+
+    async def test_normal_completion_still_yields_every_token(self):
+        """The detached-worker change must not truncate a healthy stream."""
+        events = [
+            {"contentBlockDelta": {"delta": {"text": "a"}}},
+            {"contentBlockDelta": {"delta": {"text": "b"}}},
+            {"messageStop": {"stopReason": "end_turn"}},
+        ]
+        client = self._client_over(iter(events))
+
+        assert [t async for t in client.converse_stream("q")] == ["a", "b"]
+
+    async def test_abandon_during_the_api_call_still_releases_the_worker(self):
+        """The window before the EventStream exists.
+
+        `converse_stream` (the boto3 call) takes time; a client disconnecting during
+        it finds nothing to close, so the worker would drain the entire response —
+        holding an executor slot and billing tokens for a caller already gone. The
+        `abandoned` flag covers that window.
+        """
+        import threading
+        import time
+
+        closed = threading.Event()
+        drained_fully = threading.Event()
+
+        class _Stream:
+            def __iter__(self):
+                for _ in range(40):
+                    if closed.is_set():
+                        raise RuntimeError("closed")
+                    time.sleep(0.02)
+                drained_fully.set()
+                yield {"contentBlockDelta": {"delta": {"text": "late"}}}
+
+            def close(self):
+                closed.set()
+
+        def _slow_api(**_kwargs):
+            time.sleep(0.3)  # API in flight — nothing closeable yet
+            return {"stream": _Stream()}
+
+        from coa_serve.clients.bedrock import BedrockLLMClient
+
+        mock_client = MagicMock()
+        mock_client.converse_stream = _slow_api
+        client = BedrockLLMClient(model_id="test-model", region="us-east-1")
+        client._client = mock_client
+
+        agen = client.converse_stream("q")
+        pending = asyncio.ensure_future(agen.__anext__())
+        await asyncio.sleep(0.05)  # disconnect BEFORE the API returns
+        pending.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await pending
+        await agen.aclose()
+
+        # The worker sees the flag right after the API call returns.
+        for _ in range(50):
+            if closed.is_set():
+                break
+            await asyncio.sleep(0.05)
+
+        assert closed.is_set(), "worker kept the stream open after the caller left"
+        assert not drained_fully.is_set(), "worker drained the whole response for a gone caller"
+
+    async def test_normal_completion_is_not_treated_as_abandoned(self):
+        """The flag must not fire on the healthy path and truncate the stream."""
+        events = [
+            {"contentBlockDelta": {"delta": {"text": "a"}}},
+            {"contentBlockDelta": {"delta": {"text": "b"}}},
+            {"contentBlockDelta": {"delta": {"text": "c"}}},
+            {"messageStop": {"stopReason": "end_turn"}},
+        ]
+        client = self._client_over(iter(events))
+
+        assert [t async for t in client.converse_stream("q")] == ["a", "b", "c"]
+
+    async def test_stream_without_close_method_is_tolerated(self):
+        """A plain iterator has no close(); finalization must still not raise."""
+        agen = self._client_over(iter([{"contentBlockDelta": {"delta": {"text": "x"}}}])).converse_stream("q")
+
+        assert await agen.__anext__() == "x"
+        await agen.aclose()
 
 
 @pytest.mark.unit

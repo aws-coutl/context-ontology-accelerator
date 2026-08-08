@@ -497,10 +497,25 @@ class TestSQLFirewallProfileTypeValidation:
         assert result.denied
         assert "columnDenylist" in result.reason
 
-    def test_empty_list_allowlist_treated_as_unset(self):
-        """An empty allowlist should not impose any restriction (matches falsy check)."""
+    def test_empty_list_allowlist_denies_every_table(self):
+        """SEMANTICS CHANGE — an empty allowlist is a restriction, not its absence.
+
+        This previously asserted the opposite ("should not impose any restriction"),
+        which documented a fail-open: the empty list was falsy, so the restriction
+        was dropped and every table was allowed. A grant declaring an empty
+        allowlist means "no tables permitted", and collapsing that into
+        "unrestricted" turned a deny-all into an allow-all. Absence of the key still
+        means unrestricted — see the test below.
+        """
         fw = SQLFirewall()
         result = fw.evaluate("SELECT * FROM orders", profile={"tableAllowlist": []})
+        assert result.denied
+        assert "orders" in (result.reason or "")
+
+    def test_absent_allowlist_imposes_no_restriction(self):
+        """The counterpart to the above: absence really does mean unrestricted."""
+        fw = SQLFirewall()
+        result = fw.evaluate("SELECT * FROM orders", profile={})
         assert not result.denied
 
     def test_empty_dict_denylist_treated_as_unset(self):

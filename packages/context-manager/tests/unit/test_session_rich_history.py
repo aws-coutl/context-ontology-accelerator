@@ -19,6 +19,8 @@ from coa_serve.session import (
     _parse_assistant_content,
 )
 
+pytestmark = pytest.mark.unit
+
 # ---------------------------------------------------------------------------
 # SessionManager.generate_session_id
 # ---------------------------------------------------------------------------

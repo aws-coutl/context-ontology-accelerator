@@ -16,8 +16,11 @@ import datetime
 import json
 from decimal import Decimal
 
+import pytest
 from coa_serve.serialization import json_safe as _json_safe
 from coa_serve.session import _build_message_envelope
+
+pytestmark = pytest.mark.unit
 
 
 class TestEnvelopeDecimalSerialization:

@@ -141,7 +141,16 @@ export function extractUri(body: string, pred: string): string | null {
   return m ? localName(m[1]) : null;
 }
 
-/** Friendly ontology label from a (possibly long) ontology id/URI. */
+/**
+ * Friendly ontology label from a (possibly long) ontology id/URI.
+ *
+ * NOTE: this is presentation-only — it maps a known ontology id to a short
+ * human-readable name for the UI. The substring tests below are deliberately
+ * loose pattern matching over well-known ontology namespaces, NOT a security
+ * check: nothing is trusted, authorized, or fetched based on the result, and an
+ * unrecognised id falls through to the last path segments. Do not reuse this
+ * helper to validate or sanitize a URL.
+ */
 export function ontologyLabel(ontologyId: string | null | undefined): string {
   if (!ontologyId) return "";
   if (ontologyId.includes("schema.org")) return "schema.org";

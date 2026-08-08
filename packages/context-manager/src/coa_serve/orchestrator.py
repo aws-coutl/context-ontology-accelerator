@@ -738,12 +738,16 @@ class Orchestrator:
             )
 
             # enforce allowedMetrics grant-profile restriction before
-            # execution. Fail closed: if a profile carries a non-empty allowedMetrics,
-            # the matched metric must be in that list (by metric_id or metric_name).
-            # An unset/empty allowedMetrics = no restriction (sparse opt-in, matching
-            # tableAllowlist/columnDenylist convention in sql_firewall.py).
+            # execution. Fail closed: if a profile DECLARES allowedMetrics, the
+            # matched metric must be in that list (by metric_id or metric_name).
+            #
+            # ``is not None``, not truthiness: an ABSENT allowedMetrics means "no
+            # metric constraint" (sparse opt-in), but an explicitly EMPTY one means
+            # "no metrics permitted". Collapsing the two would make a deny-all
+            # grant fail OPEN — the same empty-vs-absent bug fixed for
+            # tableAllowlist in sql_firewall.py.
             allowed_metrics = profile.get("allowedMetrics")
-            if allowed_metrics and (
+            if allowed_metrics is not None and (
                 metric_match.metric_id not in allowed_metrics and metric_match.metric_name not in allowed_metrics
             ):
                 principal_id = profile.get("userId", "unknown")

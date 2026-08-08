@@ -135,6 +135,67 @@ Layer 2: SQL Firewall (at query execution)
 
 Both layers must allow for a query to succeed.
 
+#### How restrictions combine
+
+Two rules, one per layer:
+
+- **Layer 1 (Cedar) is action-level and most-permissive.** Roles union: if any role
+  the principal holds permits the action, it is allowed. Platform roles grant
+  actions broadly — `platform-viewer` permits `query`, `translateQuery`,
+  `searchDocuments`, `traverseGraph` and the read actions across *all* namespaces,
+  and `platform-admin` permits every action on every resource.
+- **Layer 2 (SQL firewall) is data-level and most-restrictive.** Restrictions
+  **accumulate and never dissolve**:
+  - `columnDenylist` — a column is denied if **any** grant on that namespace denies
+    it.
+  - `tableAllowlist` / `allowedMetrics` — the union of the lists that grants
+    actually **declare**. A grant that declares none contributes no constraint; it
+    does *not* remove the constraints other grants declared. Access is unrestricted
+    only when **no** grant declares a list.
+
+Restrictions are also **namespace-scoped**: they come only from grants on the
+namespace being queried, and a `GLOBAL`-scoped platform grant never participates.
+
+**No role bypasses layer 2 — including `platform-admin`.** This mirrors how the
+rest of the system already works: an explicit `Deny` beats any `Allow` in IAM,
+`forbid` beats `permit` in Cedar, and this project's own `default.cedar` states
+that its "no mutations unless ACTIVE" invariant is *not* a role-overridable default
+even for `platform-admin`.
+
+##### What this means in practice
+
+| Grants held on `ns-Z` | Effective data restrictions |
+|---|---|
+| `data-analyst` with `columnDenylist: {customers: [ssn]}` | `ssn` denied |
+| the same, **plus** `platform-admin` (GLOBAL) | `ssn` still denied |
+| the same, **plus** `namespace-owner` on `ns-Z` (no restrictions) | `ssn` still denied |
+| `data-analyst` allowing `[customers]` + `reviewer` allowing `[orders]` | both tables allowed |
+| `platform-admin` only, no grant on `ns-Z` | none — no grant declares any |
+
+The third row is the one worth internalising: **adding a broader role does not
+widen data access.** To lift a restriction, revoke or amend the grant that carries
+it. That is deliberate — the alternative silently disabled PII denylists whenever a
+principal also held an unrestricted role on the same namespace.
+
+Note the last row: restrictions are *sparse opt-in*. A principal with no grant on a
+namespace has nothing to derive restrictions from, so `platform-admin` alone reads
+without data-level limits. Restrict by attaching a restricted grant, not by
+expecting platform roles to be limited by default.
+
+**Break-glass.** If an operator genuinely needs to read past a restriction, amend
+or issue the grant explicitly. That is recorded in the grants table — durable,
+attributable, and revocable — rather than waived by configuration. There is no
+configuration switch that relaxes the merge: the restrictive semantics are not
+operator-overridable.
+
+**Declared-empty restrictions.** An explicitly empty `tableAllowlist` (or
+`allowedMetrics`) on a grant means "nothing permitted" — a deny-all restriction —
+and is distinct from omitting the field, which means "no constraint from this
+grant." Deny-all grants are created via the API by passing `[]` explicitly; the
+web console's blank field intentionally omits the field (unrestricted). Listings
+return the declared-empty value so a deny-all grant is never mistaken for an
+unrestricted one.
+
 ### List Namespace Grants
 
 `GET /namespaces/{namespaceId}/grants` — see **ListNamespaceGrants** in the
@@ -200,3 +261,8 @@ a `Group` principal.
 Grant `platform-viewer` to an auditors group via `POST /grants` with
 `principalType: "Group"` — see **CreatePlatformGrant** in the
 [API Reference](#/api-reference).
+
+`platform-viewer` does **not** relax namespace-scoped data restrictions, so it
+composes with the PII pattern above: an auditor who also holds `data-analyst` with
+a `columnDenylist` can reach every namespace but still cannot read the denied
+columns. See "How restrictions combine" above.

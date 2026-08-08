@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.unit
+
 # Load the patch module directly from its file rather than through
 # ``coa_serve.lexical``, whose package __init__ imports graphrag_toolkit
 # at module load. The module under test has no graphrag import-time dependency (all
